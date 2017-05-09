@@ -6,6 +6,12 @@ print reduce(operator.add, "hello world")
 
 print reduce(operator.add, "", 0)
 
+try:
+    print reduce(operator.add, "hello world", 0)
+except TypeError, e:
+    print e
+
+
 def f(a, b):
     print "f", a, b
     return b
@@ -15,4 +21,9 @@ print reduce(f, "abc")
 try:
     print reduce(f, [])
 except TypeError, e:
+    print e
+
+try:
+    print reduce(lambda x, y: x / y, range(-10, 10))
+except Exception as e:
     print e

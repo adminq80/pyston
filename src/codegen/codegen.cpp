@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,15 +20,57 @@
 #include <unistd.h>
 
 #include "llvm/ExecutionEngine/JITEventListener.h"
-#include "llvm/ExecutionEngine/ObjectImage.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/FileSystem.h"
 
+#include "analysis/function_analysis.h"
+#include "analysis/scoping_analysis.h"
+#include "codegen/baseline_jit.h"
+#include "codegen/compvars.h"
+#include "core/bst.h"
+#include "core/cfg.h"
 #include "core/util.h"
+#include "runtime/types.h"
 
 namespace pyston {
 
-DS_DEFINE_RWLOCK(codegen_rwlock);
+void BoxedCode::addVersion(CompiledFunction* compiled) {
+    assert(compiled);
+    assert((compiled->spec != NULL) + (compiled->entry_descriptor != NULL) == 1);
+    assert(compiled->code_obj);
+    assert(compiled->code);
+
+    if (compiled->entry_descriptor == NULL) {
+        bool could_have_speculations = (source.get() != NULL);
+        if (!could_have_speculations && compiled->effort == EffortLevel::MAXIMAL && compiled->spec->accepts_all_inputs
+            && compiled->spec->boxed_return_value
+            && (versions.size() == 0 || (versions.size() == 1 && !always_use_version.empty()))) {
+            always_use_version.get(compiled->exception_style) = compiled;
+        } else
+            assert(always_use_version.empty());
+
+        assert(compiled->spec->arg_types.size() == numReceivedArgs());
+        versions.push_back(compiled);
+    } else {
+        osr_versions.push_back(compiled);
+    }
+}
+
+SourceInfo::SourceInfo(BoxedModule* m, ScopingResults scoping, FutureFlags future_flags, int ast_type,
+                       bool is_generator)
+    : parent_module(m),
+      scoping(std::move(scoping)),
+      cfg(NULL),
+      future_flags(future_flags),
+      is_generator(is_generator),
+      ast_type(ast_type) {
+}
+
+SourceInfo::~SourceInfo() {
+    delete cfg;
+}
 
 void FunctionAddressRegistry::registerFunction(const std::string& name, void* addr, int length,
                                                llvm::Function* llvm_func) {
@@ -135,20 +177,15 @@ std::string FunctionAddressRegistry::getFuncNameAtAddress(void* addr, bool deman
 
 class RegistryEventListener : public llvm::JITEventListener {
 public:
-    void NotifyObjectEmitted(const llvm::ObjectImage& Obj) {
+    virtual void NotifyObjectEmitted(const llvm::object::ObjectFile& Obj,
+                                     const llvm::RuntimeDyld::LoadedObjectInfo& L) {
         static StatCounter code_bytes("code_bytes");
         code_bytes.log(Obj.getData().size());
 
         llvm_error_code code;
-        for (llvm::object::symbol_iterator I = Obj.begin_symbols(), E = Obj.end_symbols(); I != E;
-#if LLVMREV < 200442
-             I = I.increment(code)
-#else
-             ++I
-#endif
-                 ) {
-            llvm::object::section_iterator section(Obj.end_sections());
-            code = I->getSection(section);
+        for (const auto& sym : Obj.symbols()) {
+            llvm::object::section_iterator section(Obj.section_end());
+            code = sym.getSection(section);
             assert(!code);
             bool is_text;
 #if LLVMREV < 219314
@@ -161,18 +198,20 @@ public:
                 continue;
 
             llvm::StringRef name;
-            uint64_t addr, size;
-            code = I->getName(name);
+            code = sym.getName(name);
             assert(!code);
-            code = I->getAddress(addr);
-            assert(!code);
-            code = I->getSize(size);
+            uint64_t size;
+            code = sym.getSize(size);
             assert(!code);
 
             if (name == ".text")
                 continue;
 
-            g.func_addr_registry.registerFunction(name.data(), (void*)addr, size, NULL);
+
+            uint64_t sym_addr = L.getSymbolLoadAddress(name);
+            assert(sym_addr);
+
+            g.func_addr_registry.registerFunction(name.data(), (void*)sym_addr, size, NULL);
         }
     }
 };
@@ -181,5 +220,20 @@ GlobalState::GlobalState() : context(llvm::getGlobalContext()), cur_module(NULL)
 
 llvm::JITEventListener* makeRegistryListener() {
     return new RegistryEventListener();
+}
+
+FunctionSpecialization::FunctionSpecialization(ConcreteCompilerType* rtn_type) : rtn_type(rtn_type) {
+    accepts_all_inputs = true;
+    boxed_return_value = (rtn_type->llvmType() == UNKNOWN->llvmType());
+}
+
+FunctionSpecialization::FunctionSpecialization(ConcreteCompilerType* rtn_type,
+                                               const std::vector<ConcreteCompilerType*>& arg_types)
+    : rtn_type(rtn_type), arg_types(arg_types) {
+    accepts_all_inputs = true;
+    boxed_return_value = (rtn_type->llvmType() == UNKNOWN->llvmType());
+    for (auto t : arg_types) {
+        accepts_all_inputs = accepts_all_inputs && (t == UNKNOWN);
+    }
 }
 }

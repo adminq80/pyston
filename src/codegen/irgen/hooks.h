@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,13 +17,18 @@
 
 #include <string>
 
+#include "core/types.h"
+
 namespace pyston {
 
 struct CompiledFunction;
-class CLFunction;
 class OSRExit;
+class Box;
+class BoxedDict;
 
+CompiledFunction* compilePartialFuncInternal(OSRExit* exit);
 void* compilePartialFunc(OSRExit*);
+extern "C" CompiledFunction* reoptCompiledFuncInternal(CompiledFunction*);
 extern "C" char* reoptCompiledFunc(CompiledFunction*);
 
 class AST_Module;
@@ -32,6 +37,8 @@ void compileAndRunModule(AST_Module* m, BoxedModule* bm);
 
 // will we always want to generate unique function names? (ie will this function always be reasonable?)
 CompiledFunction* cfForMachineFunctionName(const std::string&);
+
+extern "C" void exec(Box* boxedCode, Box* globals, Box* locals, FutureFlags caller_future_flags);
 }
 
 #endif

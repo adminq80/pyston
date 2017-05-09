@@ -1,6 +1,3 @@
-# expected: fail
-# - descriptors not implemented yet
-
 def f1():
     class D(object):
         def __get__(self, instance, owner):
@@ -12,6 +9,9 @@ def f1():
 
     class C(object):
         d = D()
+
+        def __repr__(self):
+            return "<C>"
 
     print C.d
     print C().d
@@ -33,8 +33,14 @@ def f2():
             print "__getattribute__", attr
             return 1
 
+        def __repr__(self):
+            return "<MaybeDescriptor>"
+
     class HasDescriptor(object):
         x = MaybeDescriptor()
+
+        def __repr__(self):
+            return "<HasDescriptor>"
 
     hd = HasDescriptor()
     # Getting hd.x will look up type(hd.__dict__[x]).__get__
@@ -52,3 +58,16 @@ def f2():
     type(hd.x).__get__ = get
     print hd.x
 f2()
+
+def f3():
+    print type(max).__dict__['__name__'].__get__(max, 1)
+    try:
+        type(max).__dict__['__name__'].__set__(max, 1)
+    except AttributeError as e:
+        print e
+    try:
+        type(max).__dict__['__name__'].__delete__(max)
+    except AttributeError as e:
+        print e
+
+f3()

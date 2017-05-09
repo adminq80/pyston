@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,18 +21,36 @@
 namespace pyston {
 
 extern BoxedClass* list_iterator_cls;
+extern BoxedClass* list_reverse_iterator_cls;
 class BoxedListIterator : public Box {
 public:
     BoxedList* l;
     int pos;
-    BoxedListIterator(BoxedList* l);
+    BoxedListIterator(BoxedList* l, int start);
+
+    static void dealloc(BoxedListIterator* o) noexcept {
+        PyObject_GC_UnTrack(o);
+        Py_XDECREF(o->l);
+        o->cls->tp_free(o);
+    }
+
+    static int traverse(BoxedListIterator* self, visitproc visit, void* arg) noexcept {
+        Py_VISIT(self->l);
+        return 0;
+    }
 };
 
-Box* listIter(Box* self);
+Box* listIter(Box* self) noexcept;
 Box* listIterIter(Box* self);
 Box* listiterHasnext(Box* self);
-i1 listiterHasnextUnboxed(Box* self);
-Box* listiterNext(Box* self);
+llvm_compat_bool listiterHasnextUnboxed(Box* self);
+template <ExceptionStyle S> Box* listiterNext(Box* self) noexcept(S == CAPI);
+Box* listiter_next(Box* s) noexcept;
+Box* listReversed(Box* self);
+Box* listreviterHasnext(Box* self);
+llvm_compat_bool listreviterHasnextUnboxed(Box* self);
+Box* listreviterNext(Box* self);
+Box* listreviter_next(Box* s) noexcept;
 extern "C" Box* listAppend(Box* self, Box* v);
 }
 

@@ -28,3 +28,45 @@ d.__setitem__(c2, 2)
 d.__setitem__(c3, 3)
 
 print d
+
+
+# dicts need to check identify and not just equality.
+# This is important for sqlalchemy where equality constructs a sql equals clause and doesn't
+# do comparison of the objects at hand.
+d = {}
+nan = float('nan')
+d[nan] = "hello world"
+print d[nan]
+
+
+
+# Dicts should not check __eq__ for values that have different hash values,
+# even if they internally cause a hash collision.
+class C(int):
+    def __eq__(self, rhs):
+        print "eq", self, rhs
+        raise Exception("Error, should not call __eq__!")
+
+    def __hash__(self):
+        print "hash", self
+        return self
+
+d = {}
+for i in xrange(1000):
+    d[C(i)] = i
+print len(d)
+
+
+class NonEq(object):
+    def __eq__(self, rhs):
+        1/0
+
+    def __hash__(self):
+        return 0
+
+d = {}
+d[NonEq()] = 1
+try:
+    d[NonEq()] = 2
+except ZeroDivisionError as e:
+    print e

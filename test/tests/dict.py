@@ -1,7 +1,7 @@
-d = {2:2}
+d = {2:"should get overwritten", 2L:2}
 d[1] = 1
 print d
-print d[1]
+print d[1], d[1L], d[1.0], d[True]
 
 d = {}
 for i in xrange(10):
@@ -127,11 +127,9 @@ print d
 
 # fromkeys
 
-d = {1:2, 3:4}
-
-print sorted(d.fromkeys([1,2]).items())
-print sorted(d.fromkeys([]).items())
-print sorted(d.fromkeys([3,4], 5).items())
+print sorted(dict.fromkeys([1,2]).items())
+print sorted(dict.fromkeys([]).items())
+print sorted(dict.fromkeys([3,4], 5).items())
 
 try:
     print d.fromkeys()
@@ -163,3 +161,95 @@ try:
     assert 0
 except KeyError, e:
     print 'ok'
+
+d = {}
+d.update({1:2, 3:4})
+print sorted(d.items())
+print sorted(dict(d).items())
+
+class CustomMapping(object):
+    def __init__(self):
+        self.n = 0
+
+    def keys(self):
+        print "keys()"
+        return [1, 3, 7]
+
+    def __getitem__(self, key):
+        print key
+        self.n += 1
+        return self.n
+
+print sorted(dict(CustomMapping()).items())
+cm = CustomMapping()
+def custom_keys():
+    print "custom_keys()"
+    return [2, 4, 2]
+cm.keys = custom_keys
+print sorted(dict(cm).items())
+
+d = {}
+d.update({'c':3}, a=1, b=2)
+print sorted(d.items())
+
+# viewkeys / viewvalues / viewitems
+
+d = {}
+keys = d.keys()
+viewkeys = d.viewkeys()
+
+print list(d.viewkeys())
+print list(d.viewvalues())
+print list(d.viewitems())
+print 'keys of d: ', keys
+print 'viewkeys of d: ', list(viewkeys)
+
+d['a'] = 1
+
+print list(d.viewkeys())
+print list(d.viewvalues())
+print list(d.viewitems())
+print 'keys of d: ', keys
+print 'viewkeys of d: ', list(viewkeys)
+
+print {} == {}
+d1 = {}
+d2 = {}
+for i in xrange(6):
+    d1[i] = 5 - i
+    d2[5 - i] = i
+    print d1 == d2, d1 != d2
+
+
+d = dict([(i, i**2) for i in xrange(10)])
+i = d.iteritems()
+l = []
+while True:
+    try:
+        l.append(i.next())
+    except StopIteration:
+        break
+print sorted(l)
+
+#recursive printing test
+d = dict()
+d['two'] = d
+print d
+
+
+# Remove an item using a different key:
+d = {1:1}
+d.pop(1L)
+
+
+# dict() will try to access the "keys" attribute, but it should swallow all exceptions
+class MyObj(object):
+    def __iter__(self):
+        print "iter!"
+        return [(1, 2)].__iter__()
+
+    def __getattr__(self, attr):
+        print "getattr", attr
+        1/0
+
+print dict(MyObj())

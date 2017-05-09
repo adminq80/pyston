@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,29 +15,19 @@
 #ifndef PYSTON_CODEGEN_IRGEN_FUTURE_H
 #define PYSTON_CODEGEN_IRGEN_FUTURE_H
 
-#include <map>
+#include "llvm/ADT/ArrayRef.h"
 
-#include "core/ast.h"
-#include "core/options.h"
 #include "core/types.h"
 
 namespace pyston {
 
-#define FF_ABSOLUTE_IMPORT 0x01
-#define FF_DIVISION 0x02
-#define FF_GENERATOR 0x04
-#define FF_UNICODE_LITERALS 0x08
-#define FF_PRINT_FUNCTION 0x10
-#define FF_NESTED_SCOPES 0x20
-#define FF_WITH_STATEMENT 0x40
-
-typedef int FutureFlags;
+class AST_stmt;
 
 // Loop through import statements to find __future__ imports throwing errors for
 // bad __future__ imports. Returns the futures that are turned on. This is used
 // for irgeneration; the parser still has to handle some futures on its own,
 // when they are relevant for the parser.
-FutureFlags getFutureFlags(AST_Module* m, const char* file);
+FutureFlags getFutureFlags(llvm::ArrayRef<AST_stmt*> body, const char* file);
 }
 
 #endif

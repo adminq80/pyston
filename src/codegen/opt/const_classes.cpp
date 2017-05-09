@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,9 +62,9 @@ private:
             llvm::errs() << "Constant-folding this load: " << *li << '\n';
         }
         if (gv->getName() == "True")
-            li->replaceAllUsesWith(embedConstantPtr(True, g.llvm_bool_type_ptr));
+            li->replaceAllUsesWith(embedConstantPtr(Py_True, g.llvm_bool_type_ptr));
         else
-            li->replaceAllUsesWith(embedConstantPtr(False, g.llvm_bool_type_ptr));
+            li->replaceAllUsesWith(embedConstantPtr(Py_False, g.llvm_bool_type_ptr));
         return true;
     }
 
@@ -87,14 +87,6 @@ private:
         std::vector<Instruction*> to_remove;
         for (User* user : li->users()) {
             if (CallInst* call = dyn_cast<CallInst>(user)) {
-                if (call->getCalledFunction()->getName() == "_maybeDecrefCls") {
-                    errs() << "Found decrefcls call: " << *call << '\n';
-                    if (!isUserDefined(cls)) {
-                        // Don't delete right away; I think that invalidates the iterator
-                        // we're currently iterating over
-                        to_remove.push_back(call);
-                    }
-                }
                 continue;
             }
 
@@ -107,13 +99,16 @@ private:
             APInt ap_offset(64, 0, true);
 #if LLVMREV < 214781
             bool success = gep->accumulateConstantOffset(*g.tm->getDataLayout(), ap_offset);
-#else
+#elif LLVMREV < 227113
             bool success = gep->accumulateConstantOffset(*g.tm->getSubtargetImpl()->getDataLayout(), ap_offset);
+#else
+            bool success = gep->accumulateConstantOffset(*g.tm->getDataLayout(), ap_offset);
 #endif
             assert(success);
             int64_t offset = ap_offset.getSExtValue();
 
-            errs() << "Found a gep at offset " << offset << ": " << *gep << '\n';
+            if (VERBOSITY("opt") >= 1)
+                errs() << "Found a gep at offset " << offset << ": " << *gep << '\n';
 
             for (User* gep_user : gep->users()) {
                 LoadInst* gep_load = dyn_cast<LoadInst>(gep_user);
@@ -123,14 +118,17 @@ private:
                 }
 
 
-                errs() << "Found a load: " << *gep_load << '\n';
+                if (VERBOSITY("opt") >= 1)
+                    errs() << "Found a load: " << *gep_load << '\n';
 
                 if (offset == offsetof(BoxedClass, attrs_offset)) {
-                    errs() << "attrs_offset; replacing with " << cls->attrs_offset << "\n";
+                    if (VERBOSITY("opt") >= 1)
+                        errs() << "attrs_offset; replacing with " << cls->attrs_offset << "\n";
                     replaceUsesWithConstant(gep_load, cls->attrs_offset);
                     changed = true;
                 } else if (offset == offsetof(BoxedClass, tp_basicsize)) {
-                    errs() << "tp_basicsize; replacing with " << cls->tp_basicsize << "\n";
+                    if (VERBOSITY("opt") >= 1)
+                        errs() << "tp_basicsize; replacing with " << cls->tp_basicsize << "\n";
                     replaceUsesWithConstant(gep_load, cls->tp_basicsize);
                     changed = true;
                 }

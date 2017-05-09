@@ -1,8 +1,15 @@
 import os
 import sys
+import re
 
 def file_is_from_cpython(fn):
-    return '2.7' in fn
+    if 'from_cpython' in fn:
+        return True
+
+    if fn.endswith("/thread_pthread.h"):
+        return True
+
+    return False
 
 def verify_include_guard(_, dir, files):
     for bn in files:
@@ -18,6 +25,7 @@ def verify_include_guard(_, dir, files):
         with open(fn) as f:
             while True:
                 l = f.readline()
+                assert l, "Did not find include guard in " + fn
                 if l.startswith('//') or not l.strip():
                     continue
                 break
@@ -35,13 +43,15 @@ def verify_license(_, dir, files):
             elif fn.endswith("/astprint.cpp"):
                 continue
             else:
-                assert "Copyright (c) 2014 Dropbox, Inc." in s, fn
+                assert "Copyright (c) 2014-2016 Dropbox, Inc." in s, fn
                 assert "Apache License, Version 2.0" in s, fn
 
 PYSTON_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../src"))
 PYSTON_SRC_SUBDIRS = [bn for bn in os.listdir(PYSTON_SRC_DIR) if os.path.isdir(os.path.join(PYSTON_SRC_DIR, bn))]
-CAPI_HEADER_DIR = os.path.join(PYSTON_SRC_DIR, "../include")
+CAPI_HEADER_DIR = os.path.join(PYSTON_SRC_DIR, "../from_cpython/Include")
 CAPI_HEADERS = [bn for bn in os.listdir(CAPI_HEADER_DIR) if bn.endswith(".h")]
+
+include_re = re.compile(r'^\#include \s+ (<.+?>|".+?") (?:\s+ //.*)? $', re.VERBOSE)
 
 def verify_include_order(_, dir, files):
     for bn in files:
@@ -65,10 +75,17 @@ def verify_include_order(_, dir, files):
                         section = None
                     continue
 
-                if l.startswith("#include"):
+                m = include_re.match(l)
+                if m:
+                    # Python-ast.h is a tricky include file since it 1) doesn't have include guards, and 2)
+                    # it doesn't include its dependencies.  Let it (and cpython_ast.h which includes it)
+                    # avoid the lint rules.
+                    if m.group(1) == '"Python-ast.h"' or m.group(1) == '"cpython_ast.h"':
+                        continue
+
                     if section is None:
                         section = []
-                    section.append(l)
+                    section.append(m.group(1))
                     continue
 
                 if l.startswith("#ifndef PYSTON") or l.startswith("#define PYSTON"):
@@ -93,7 +110,7 @@ def verify_include_order(_, dir, files):
 
         def is_third_party_section(section):
             for incl in section:
-                if incl.startswith('#include "llvm/'):
+                if incl.startswith('"llvm/'):
                     continue
                 if '"opagent.h"' in incl:
                     continue
@@ -113,7 +130,7 @@ def verify_include_order(_, dir, files):
             # TODO generate this
             include_dirs = PYSTON_SRC_SUBDIRS
             for incl in section:
-                if not any(incl.startswith('#include "%s/' % d) for d in include_dirs):
+                if not any(incl.startswith('"%s/' % d) for d in include_dirs):
                     return False
             return True
 

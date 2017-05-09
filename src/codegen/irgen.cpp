@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,15 +16,22 @@
 
 #include <cstdio>
 #include <iostream>
-#include <sstream>
+#include <set>
 #include <stdint.h>
 
 #include "llvm/Analysis/Passes.h"
+#include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#if LLVMREV < 229094
 #include "llvm/PassManager.h"
+#else
+#include "llvm/IR/LegacyPassManager.h"
+#endif
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
 #include "llvm/Transforms/Instrumentation.h"
@@ -44,7 +51,7 @@
 #include "codegen/osrentry.h"
 #include "codegen/patchpoints.h"
 #include "codegen/stackmaps.h"
-#include "core/ast.h"
+#include "core/bst.h"
 #include "core/cfg.h"
 #include "core/options.h"
 #include "core/stats.h"
@@ -63,18 +70,7 @@ void MyInserter::InsertHelper(llvm::Instruction* I, const llvm::Twine& Name, llv
     llvm::IRBuilderDefaultInserter<true>::InsertHelper(I, Name, BB, InsertPt);
 }
 
-static void addIRDebugSymbols(llvm::Function* f) {
-    llvm::legacy::PassManager mpm;
-
-    llvm_error_code code = llvm::sys::fs::create_directory(".debug_ir", true);
-    assert(!code);
-
-    mpm.add(llvm::createDebugIRPass(false, false, ".debug_ir", f->getName()));
-
-    mpm.run(*g.cur_module);
-}
-
-static void optimizeIR(llvm::Function* f, EffortLevel::EffortLevel effort) {
+static void optimizeIR(llvm::Function* f, EffortLevel effort) {
     // TODO maybe should do some simple passes (ex: gvn?) if effort level isn't maximal?
     // In general, this function needs a lot of tuning.
     if (effort < EffortLevel::MAXIMAL)
@@ -82,13 +78,23 @@ static void optimizeIR(llvm::Function* f, EffortLevel::EffortLevel effort) {
 
     Timer _t("optimizing");
 
+#if LLVMREV < 229094
     llvm::FunctionPassManager fpm(g.cur_module);
+#else
+    llvm::legacy::FunctionPassManager fpm(g.cur_module);
+#endif
+
 
 #if LLVMREV < 217548
     fpm.add(new llvm::DataLayoutPass(*g.tm->getDataLayout()));
 #else
     fpm.add(new llvm::DataLayoutPass());
 #endif
+
+    if (ENABLE_PYSTON_PASSES) {
+        fpm.add(createRemoveUnnecessaryBoxingPass());
+        fpm.add(createRemoveDuplicateBoxingPass());
+    }
 
     if (ENABLE_INLINING && effort >= EffortLevel::MAXIMAL)
         fpm.add(makeFPInliner(275));
@@ -104,20 +110,27 @@ static void optimizeIR(llvm::Function* f, EffortLevel::EffortLevel effort) {
     if (ENABLE_PYSTON_PASSES)
         fpm.add(createMallocsNonNullPass());
 
-    // TODO Find the right place for this pass (and ideally not duplicate it)
-    if (ENABLE_PYSTON_PASSES) {
-        fpm.add(llvm::createGVNPass());
-        fpm.add(createConstClassesPass());
-    }
-
     // TODO: find the right set of passes
-    if (0) {
-        // My original set of passes, that seem to get about 90% of the benefit:
+    if (1) {
+        // Small set of passes:
         fpm.add(llvm::createInstructionCombiningPass());
         fpm.add(llvm::createReassociatePass());
         fpm.add(llvm::createGVNPass());
         fpm.add(llvm::createCFGSimplificationPass());
+
+        if (ENABLE_PYSTON_PASSES) {
+            fpm.add(createConstClassesPass());
+            fpm.add(createDeadAllocsPass());
+            fpm.add(llvm::createInstructionCombiningPass());
+            fpm.add(llvm::createCFGSimplificationPass());
+        }
     } else {
+        // TODO Find the right place for this pass (and ideally not duplicate it)
+        if (ENABLE_PYSTON_PASSES) {
+            fpm.add(llvm::createGVNPass());
+            fpm.add(createConstClassesPass());
+        }
+
         // copied + slightly modified from llvm/lib/Transforms/IPO/PassManagerBuilder.cpp::populateModulePassManager
         fpm.add(llvm::createEarlyCSEPass());                   // Catch trivial redundancies
         fpm.add(llvm::createJumpThreadingPass());              // Thread jumps.
@@ -161,19 +174,19 @@ static void optimizeIR(llvm::Function* f, EffortLevel::EffortLevel effort) {
         // fpm.add(llvm::createLoopVectorizePass(DisableUnrollLoops, LoopVectorize));
         fpm.add(llvm::createInstructionCombiningPass());
         fpm.add(llvm::createCFGSimplificationPass());
-    }
 
-    // TODO Find the right place for this pass (and ideally not duplicate it)
-    if (ENABLE_PYSTON_PASSES) {
-        fpm.add(createConstClassesPass());
-        fpm.add(llvm::createInstructionCombiningPass());
-        fpm.add(llvm::createCFGSimplificationPass());
-        fpm.add(createConstClassesPass());
-        fpm.add(createDeadAllocsPass());
-        // fpm.add(llvm::createSCCPPass());                  // Constant prop with SCCP
-        // fpm.add(llvm::createEarlyCSEPass());              // Catch trivial redundancies
-        // fpm.add(llvm::createInstructionCombiningPass());
-        // fpm.add(llvm::createCFGSimplificationPass());
+        // TODO Find the right place for this pass (and ideally not duplicate it)
+        if (ENABLE_PYSTON_PASSES) {
+            fpm.add(createConstClassesPass());
+            fpm.add(llvm::createInstructionCombiningPass());
+            fpm.add(llvm::createCFGSimplificationPass());
+            fpm.add(createConstClassesPass());
+            fpm.add(createDeadAllocsPass());
+            // fpm.add(llvm::createSCCPPass());                  // Constant prop with SCCP
+            // fpm.add(llvm::createEarlyCSEPass());              // Catch trivial redundancies
+            // fpm.add(llvm::createInstructionCombiningPass());
+            // fpm.add(llvm::createCFGSimplificationPass());
+        }
     }
 
     fpm.doInitialization();
@@ -182,12 +195,12 @@ static void optimizeIR(llvm::Function* f, EffortLevel::EffortLevel effort) {
         bool changed = fpm.run(*f);
 
         if (!changed) {
-            if (VERBOSITY("irgen"))
+            if (VERBOSITY("irgen") >= 2)
                 printf("done after %d optimization iterations\n", i - 1);
             break;
         }
 
-        if (VERBOSITY("irgen") >= 1) {
+        if (VERBOSITY("irgen") >= 2) {
             fprintf(stderr, "after optimization %d:\n", i);
             printf("\033[36m");
             fflush(stdout);
@@ -208,21 +221,16 @@ static bool compareBlockPairs(const std::pair<CFGBlock*, CFGBlock*>& p1, const s
     return p1.first->idx < p2.first->idx;
 }
 
-static std::vector<std::pair<CFGBlock*, CFGBlock*> >
-computeBlockTraversalOrder(const BlockSet& full_blocks, const BlockSet& partial_blocks, CFGBlock* start) {
+static std::vector<std::pair<CFGBlock*, CFGBlock*>> computeBlockTraversalOrder(const BlockSet& blocks,
+                                                                               CFGBlock* start) {
 
-    std::vector<std::pair<CFGBlock*, CFGBlock*> > rtn;
+    std::vector<std::pair<CFGBlock*, CFGBlock*>> rtn;
     std::unordered_set<CFGBlock*> in_queue;
 
     if (start) {
-        assert(full_blocks.count(start));
+        assert(blocks.count(start));
         in_queue.insert(start);
         rtn.push_back(std::make_pair(start, (CFGBlock*)NULL));
-    }
-
-    for (CFGBlock* b : partial_blocks) {
-        in_queue.insert(b);
-        rtn.push_back(std::make_pair(b, (CFGBlock*)NULL));
     }
 
     // It's important for debugging purposes that the order is deterministic, but the iteration
@@ -230,7 +238,7 @@ computeBlockTraversalOrder(const BlockSet& full_blocks, const BlockSet& partial_
     std::sort(rtn.begin(), rtn.end(), compareBlockPairs);
 
     int idx = 0;
-    while (rtn.size() < full_blocks.size() + partial_blocks.size()) {
+    while (rtn.size() < blocks.size()) {
         // TODO: come up with an alternative algorithm that outputs
         // the blocks in "as close to in-order as possible".
         // Do this by iterating over all blocks and picking the smallest one
@@ -238,9 +246,8 @@ computeBlockTraversalOrder(const BlockSet& full_blocks, const BlockSet& partial_
         while (idx < rtn.size()) {
             CFGBlock* cur = rtn[idx].first;
 
-            for (int i = 0; i < cur->successors.size(); i++) {
-                CFGBlock* b = cur->successors[i];
-                assert(full_blocks.count(b) || partial_blocks.count(b));
+            for (CFGBlock* b : cur->successors()) {
+                assert(blocks.count(b));
                 if (in_queue.count(b))
                     continue;
 
@@ -251,16 +258,16 @@ computeBlockTraversalOrder(const BlockSet& full_blocks, const BlockSet& partial_
             idx++;
         }
 
-        if (rtn.size() == full_blocks.size() + partial_blocks.size())
+        if (rtn.size() == blocks.size())
             break;
 
         CFGBlock* best = NULL;
-        for (CFGBlock* b : full_blocks) {
+        for (CFGBlock* b : blocks) {
             if (in_queue.count(b))
                 continue;
 
             // Avoid picking any blocks where we can't add an epilogue to the predecessors
-            if (b->predecessors.size() == 1 && b->predecessors[0]->successors.size() > 1)
+            if (b->predecessors.size() == 1 && b->predecessors[0]->successors().size() > 1)
                 continue;
 
             if (best == NULL || b->idx < best->idx)
@@ -268,76 +275,161 @@ computeBlockTraversalOrder(const BlockSet& full_blocks, const BlockSet& partial_
         }
         assert(best != NULL);
 
-        if (VERBOSITY("irgen") >= 1)
+        if (VERBOSITY("irgen") >= 2)
             printf("Giving up and adding block %d to the order\n", best->idx);
         in_queue.insert(best);
         rtn.push_back(std::make_pair(best, (CFGBlock*)NULL));
     }
 
-    ASSERT(rtn.size() == full_blocks.size() + partial_blocks.size(), "%ld\n", rtn.size());
+    ASSERT(rtn.size() == blocks.size(), "%ld\n", rtn.size());
     return rtn;
 }
 
-static ConcreteCompilerType* getTypeAtBlockStart(TypeAnalysis* types, const std::string& name, CFGBlock* block) {
-    if (startswith(name, "!is_defined"))
-        return BOOL;
-    else if (name == PASSED_GENERATOR_NAME)
-        return GENERATOR;
-    else if (name == PASSED_CLOSURE_NAME)
-        return CLOSURE;
-    else
-        return types->getTypeAtBlockStart(name, block);
+static ConcreteCompilerType* getTypeAtBlockStart(TypeAnalysis* types, int vreg, CFGBlock* block) {
+    // This could crash if we call getTypeAtBlockStart on something that doesn't have a type or vreg.
+    // Luckily it looks like we don't do that.
+    return types->getTypeAtBlockStart(vreg, block);
 }
 
-static void emitBBs(IRGenState* irstate, const char* bb_type, GuardList& out_guards, const GuardList& in_guards,
-                    TypeAnalysis* types, const OSREntryDescriptor* entry_descriptor, const BlockSet& full_blocks,
-                    const BlockSet& partial_blocks) {
+llvm::Value* handlePotentiallyUndefined(ConcreteCompilerVariable* is_defined_var, llvm::Type* rtn_type,
+                                        llvm::BasicBlock*& cur_block, IREmitter& emitter, bool speculate_undefined,
+                                        std::function<llvm::Value*(IREmitter&)> when_defined,
+                                        std::function<llvm::Value*(IREmitter&)> when_undefined) {
+    if (!is_defined_var)
+        return when_defined(emitter);
+
+    assert(is_defined_var->getType() == BOOL);
+    llvm::Value* is_defined_i1 = i1FromBool(emitter, is_defined_var);
+
+    llvm::BasicBlock* ifdefined_block = emitter.createBasicBlock();
+    ifdefined_block->moveAfter(cur_block);
+    llvm::BasicBlock* join_block = emitter.createBasicBlock();
+    join_block->moveAfter(ifdefined_block);
+    llvm::BasicBlock* undefined_block;
+
+    llvm::Value* val_if_undefined;
+    if (speculate_undefined) {
+        val_if_undefined = when_undefined(emitter);
+        undefined_block = cur_block;
+        emitter.getBuilder()->CreateCondBr(is_defined_i1, ifdefined_block, join_block);
+    } else {
+        undefined_block = emitter.createBasicBlock();
+        undefined_block->moveAfter(cur_block);
+        emitter.getBuilder()->CreateCondBr(is_defined_i1, ifdefined_block, undefined_block);
+
+        cur_block = undefined_block;
+        emitter.getBuilder()->SetInsertPoint(undefined_block);
+        val_if_undefined = when_undefined(emitter);
+        emitter.getBuilder()->CreateBr(join_block);
+    }
+
+    cur_block = ifdefined_block;
+    emitter.getBuilder()->SetInsertPoint(ifdefined_block);
+    llvm::Value* val_if_defined = when_defined(emitter);
+    emitter.getBuilder()->CreateBr(join_block);
+
+    cur_block = join_block;
+    emitter.getBuilder()->SetInsertPoint(join_block);
+    auto phi = emitter.getBuilder()->CreatePHI(rtn_type, 2);
+    phi->addIncoming(val_if_undefined, undefined_block);
+    phi->addIncoming(val_if_defined, ifdefined_block);
+    return phi;
+}
+
+// This is used to filter out any names set by an invoke statement at the end of the previous block, if we're in the
+// unwind path.
+class SymTableDstVRegDeleter : NoopBSTVisitor {
+private:
+    SymbolTable* sym_table;
+    bool created_new_sym_table;
+
+    SymTableDstVRegDeleter(const CodeConstants& code_constants, SymbolTable* sym_table)
+        : NoopBSTVisitor(code_constants), sym_table(sym_table), created_new_sym_table(false) {}
+
+protected:
+    bool visit_vreg(int* vreg, bool is_dst = false) override {
+        if (!is_dst || *vreg == VREG_UNDEFINED || !(*sym_table)[*vreg])
+            return false;
+
+        if (!created_new_sym_table) {
+            sym_table = new SymbolTable(*sym_table);
+            created_new_sym_table = true;
+        }
+        (*sym_table)[*vreg] = NULL;
+        return false;
+    }
+    bool visit_storename(BST_StoreName* node) override {
+        InternedString name = getCodeConstants().getInternedString(node->index_id);
+        assert(name.c_str()[0] == '#'); // it must be a temporary
+        // You might think I need to check whether `name' is being assigned globally or locally,
+        // since a global assign doesn't affect the symbol table. However, the CFG pass only
+        // generates invoke-assigns to temporary variables. Just to be sure, we assert:
+        assert(node->lookup_type != ScopeInfo::VarScopeType::GLOBAL);
+        return false;
+    }
+
+public:
+    static std::pair<SymbolTable*, bool /* created_new_sym_table */>
+    removeDestVRegsFromSymTable(const CodeConstants& code_constants, SymbolTable* sym_table, BST_stmt* stmt) {
+        SymTableDstVRegDeleter visitor(code_constants, sym_table);
+        stmt->accept(&visitor);
+        return std::make_pair(visitor.sym_table, visitor.created_new_sym_table);
+    }
+};
+
+static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDescriptor* entry_descriptor,
+                    const BlockSet& blocks) {
     SourceInfo* source = irstate->getSourceInfo();
-    EffortLevel::EffortLevel effort = irstate->getEffortLevel();
+    EffortLevel effort = irstate->getEffortLevel();
     CompiledFunction* cf = irstate->getCurFunction();
     ConcreteCompilerType* rtn_type = irstate->getReturnType();
     // llvm::MDNode* func_info = irstate->getFuncDbgInfo();
+    PhiAnalysis* phi_analysis = irstate->getPhis();
+    assert(phi_analysis);
+
+    CFG* cfg = source->cfg;
+    auto&& vreg_info = cfg->getVRegInfo();
+    int num_vregs = vreg_info.getTotalNumOfVRegs();
 
     if (entry_descriptor != NULL)
-        assert(full_blocks.count(source->cfg->getStartingBlock()) == 0);
+        assert(blocks.count(cfg->getStartingBlock()) == 0);
 
     // We need the entry blocks pre-allocated so that we can jump forward to them.
     std::unordered_map<CFGBlock*, llvm::BasicBlock*> llvm_entry_blocks;
-    for (CFGBlock* block : source->cfg->blocks) {
-        if (partial_blocks.count(block) == 0 && full_blocks.count(block) == 0) {
+    for (CFGBlock* block : cfg->blocks) {
+        if (blocks.count(block) == 0) {
             llvm_entry_blocks[block] = NULL;
             continue;
         }
 
         char buf[40];
-        snprintf(buf, 40, "%s_block%d", bb_type, block->idx);
+        snprintf(buf, 40, "block%d", block->idx);
         llvm_entry_blocks[block] = llvm::BasicBlock::Create(g.context, buf, irstate->getLLVMFunction());
     }
 
-    llvm::BasicBlock* osr_entry_block = NULL; // the function entry block, where we add the type guards
-    llvm::BasicBlock* osr_unbox_block = NULL; // the block after type guards where we up/down-convert things
-    ConcreteSymbolTable* osr_syms = NULL;     // syms after conversion
+    llvm::Value* osr_frame_info_arg = NULL, * osr_generator = NULL, * osr_created_closure = NULL;
+
+    // the function entry block, where we add the type guards [no guards anymore]
+    llvm::BasicBlock* osr_entry_block = NULL;
+    llvm::BasicBlock* osr_unbox_block_end = NULL; // the block after type guards where we up/down-convert things
+    VRegMap<ConcreteCompilerVariable*> osr_syms(num_vregs);
+    VRegMap<llvm::Value*> osr_definedness(num_vregs);
     if (entry_descriptor != NULL) {
-        osr_unbox_block = llvm::BasicBlock::Create(g.context, "osr_unbox", irstate->getLLVMFunction(),
-                                                   &irstate->getLLVMFunction()->getEntryBlock());
+        llvm::BasicBlock* osr_unbox_block = llvm::BasicBlock::Create(g.context, "osr_unbox", irstate->getLLVMFunction(),
+                                                                     &irstate->getLLVMFunction()->getEntryBlock());
         osr_entry_block = llvm::BasicBlock::Create(g.context, "osr_entry", irstate->getLLVMFunction(),
                                                    &irstate->getLLVMFunction()->getEntryBlock());
         assert(&irstate->getLLVMFunction()->getEntryBlock() == osr_entry_block);
 
-        osr_syms = new ConcreteSymbolTable();
-        SymbolTable* initial_syms = new SymbolTable();
+        VRegMap<CompilerVariable*> initial_syms(num_vregs);
         // llvm::BranchInst::Create(llvm_entry_blocks[entry_descriptor->backedge->target->idx], entry_block);
 
         llvm::BasicBlock* osr_entry_block_end = osr_entry_block;
-        llvm::BasicBlock* osr_unbox_block_end = osr_unbox_block;
+        osr_unbox_block_end = osr_unbox_block;
         std::unique_ptr<IREmitter> entry_emitter(createIREmitter(irstate, osr_entry_block_end));
         std::unique_ptr<IREmitter> unbox_emitter(createIREmitter(irstate, osr_unbox_block_end));
 
         CFGBlock* target_block = entry_descriptor->backedge->target;
-
-        // Currently we AND all the type guards together and then do just a single jump;
-        // guard_val is the current AND'd value, or NULL if there weren't any guards
-        llvm::Value* guard_val = NULL;
 
         std::vector<llvm::Value*> func_args;
         for (llvm::Function::arg_iterator AI = irstate->getLLVMFunction()->arg_begin();
@@ -346,42 +438,51 @@ static void emitBBs(IRGenState* irstate, const char* bb_type, GuardList& out_gua
         }
 
         // Handle loading symbols from the passed osr arguments:
+        osr_generator = func_args[0];
+        osr_created_closure = func_args[1];
+        osr_frame_info_arg = func_args[2];
+        llvm::Value* passed_vars = func_args[3];
+        assert(func_args.size() == 4);
+
+        irstate->getRefcounts()->setType(osr_generator, RefType::BORROWED);
+        irstate->getRefcounts()->setType(osr_created_closure, RefType::BORROWED);
+        if (source->is_generator)
+            irstate->setPassedGenerator(osr_generator);
+        if (source->scoping.createsClosure())
+            irstate->setCreatedClosure(osr_created_closure);
+
         int arg_num = -1;
         for (const auto& p : entry_descriptor->args) {
             llvm::Value* from_arg;
             arg_num++;
-            if (arg_num < 3) {
-                from_arg = func_args[arg_num];
-#ifndef NDEBUG
-                if (from_arg->getType() != p.second->llvmType()) {
-                    from_arg->getType()->dump();
-                    printf("\n");
-                    p.second->llvmType()->dump();
-                    printf("\n");
-                }
-#endif
-                assert(from_arg->getType() == p.second->llvmType());
+
+            llvm::Value* ptr = entry_emitter->getBuilder()->CreateConstGEP1_32(passed_vars, arg_num);
+            if (p.second == INT) {
+                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.i64->getPointerTo());
+            } else if (p.second == BOOL) {
+                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, BOOL->llvmType()->getPointerTo());
+            } else if (p.second == FLOAT) {
+                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.double_->getPointerTo());
+            } else if (p.second == GENERATOR) {
+                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.llvm_generator_type_ptr->getPointerTo());
+            } else if (p.second == CLOSURE) {
+                ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.llvm_closure_type_ptr->getPointerTo());
+            } else if (p.second == FRAME_INFO) {
+                ptr = entry_emitter->getBuilder()->CreateBitCast(
+                    ptr, g.llvm_frame_info_type->getPointerTo()->getPointerTo());
             } else {
-                ASSERT(func_args.size() == 4, "%ld", func_args.size());
-                llvm::Value* ptr = entry_emitter->getBuilder()->CreateConstGEP1_32(func_args[3], arg_num - 3);
-                if (p.second == INT) {
-                    ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.i64->getPointerTo());
-                } else if (p.second == BOOL) {
-                    ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, BOOL->llvmType()->getPointerTo());
-                } else if (p.second == FLOAT) {
-                    ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, g.double_->getPointerTo());
-                } else {
-                    assert(p.second->llvmType() == g.llvm_value_type_ptr);
-                }
-                from_arg = entry_emitter->getBuilder()->CreateLoad(ptr);
-                assert(from_arg->getType() == p.second->llvmType());
+                assert(p.second->llvmType() == g.llvm_value_type_ptr);
             }
+            from_arg = entry_emitter->getBuilder()->CreateLoad(ptr);
+            assert(from_arg->getType() == p.second->llvmType());
 
             ConcreteCompilerType* phi_type;
             phi_type = getTypeAtBlockStart(types, p.first, target_block);
 
-            ConcreteCompilerVariable* var = new ConcreteCompilerVariable(p.second, from_arg, true);
-            (*initial_syms)[p.first] = var;
+            irstate->getRefcounts()->setType(from_arg, RefType::BORROWED);
+
+            ConcreteCompilerVariable* var = new ConcreteCompilerVariable(p.second, from_arg);
+            initial_syms[p.first] = var;
 
             // It's possible to OSR into a version of the function with a higher speculation level;
             // this means that the types of the OSR variables are potentially higher (more unspecialized)
@@ -398,65 +499,34 @@ static void emitBBs(IRGenState* irstate, const char* bb_type, GuardList& out_gua
                 v = converted->getValue();
                 delete converted;
             } else {
-                ASSERT(p.second == UNKNOWN, "%s", p.second->debugName().c_str());
-                BoxedClass* speculated_class = NULL;
-                if (phi_type == INT) {
-                    speculated_class = int_cls;
-                } else if (phi_type == FLOAT) {
-                    speculated_class = float_cls;
-                } else {
-                    speculated_class = phi_type->guaranteedClass();
-                }
-                ASSERT(speculated_class, "%s", phi_type->debugName().c_str());
-
-                ASSERT(entry_descriptor->args.count("!is_defined_" + p.first) == 0,
-                       "This class-check-creating behavior will segfault if the argument wasn't actually defined!");
-
-                llvm::Value* type_check = ConcreteCompilerVariable(p.second, from_arg, true)
-                                              .makeClassCheck(*entry_emitter, speculated_class);
-                if (guard_val) {
-                    guard_val = entry_emitter->getBuilder()->CreateAnd(guard_val, type_check);
-                } else {
-                    guard_val = type_check;
-                }
-                // entry_emitter->getBuilder()->CreateCall(g.funcs.my_assert, type_check);
-
-                if (speculated_class == int_cls) {
-                    v = unbox_emitter->getBuilder()->CreateCall(g.funcs.unboxInt, from_arg);
-                    (new ConcreteCompilerVariable(BOXED_INT, from_arg, true))->decvref(*unbox_emitter);
-                } else if (speculated_class == float_cls) {
-                    v = unbox_emitter->getBuilder()->CreateCall(g.funcs.unboxFloat, from_arg);
-                    (new ConcreteCompilerVariable(BOXED_FLOAT, from_arg, true))->decvref(*unbox_emitter);
-                } else {
-                    assert(phi_type == typeFromClass(speculated_class));
-                    v = from_arg;
-                }
+                RELEASE_ASSERT(0, "OSR'd with a %s into a type inference of a %s?\n", p.second->debugName().c_str(),
+                               phi_type->debugName().c_str());
             }
 
-            if (VERBOSITY("irgen"))
-                v->setName("prev_" + p.first);
+            if (VERBOSITY("irgen") >= 2) {
+                v->setName("prev_" + vreg_info.getName(p.first).s());
+            }
 
-            (*osr_syms)[p.first] = new ConcreteCompilerVariable(phi_type, v, true);
+            osr_syms[p.first] = new ConcreteCompilerVariable(phi_type, v);
         }
 
-        if (guard_val) {
-            // Create the guard with both branches leading to the success_bb,
-            // and let the deopt path change the failure case to point to the
-            // as-yet-unknown deopt block.
-            // TODO Not the best approach since if we fail to do that patching,
-            // the guard will just silently be ignored.
-            llvm::BranchInst* br
-                = entry_emitter->getBuilder()->CreateCondBr(guard_val, osr_unbox_block, osr_unbox_block);
-            out_guards.registerGuardForBlockEntry(target_block, br, *initial_syms);
-        } else {
-            entry_emitter->getBuilder()->CreateBr(osr_unbox_block);
+        for (int vreg : entry_descriptor->potentially_undefined) {
+            arg_num++;
+
+            llvm::Value* ptr = entry_emitter->getBuilder()->CreateConstGEP1_32(passed_vars, arg_num);
+            ptr = entry_emitter->getBuilder()->CreateBitCast(ptr, BOOL->llvmType()->getPointerTo());
+            llvm::Value* from_arg = entry_emitter->getBuilder()->CreateLoad(ptr);
+
+            osr_definedness[vreg] = from_arg;
+            // osr_definedness[vreg] = getConstantInt(0, BOOL->llvmType());
         }
+
+        entry_emitter->getBuilder()->CreateBr(osr_unbox_block);
         unbox_emitter->getBuilder()->CreateBr(llvm_entry_blocks[entry_descriptor->backedge->target]);
 
-        for (const auto& p : *initial_syms) {
+        for (const auto& p : initial_syms) {
             delete p.second;
         }
-        delete initial_syms;
     }
 
     // In a similar vein, we need to keep track of the exit blocks for each cfg block,
@@ -468,16 +538,21 @@ static void emitBBs(IRGenState* irstate, const char* bb_type, GuardList& out_gua
     ////
     // Main ir generation: go through each basic block in the CFG and emit the code
 
+    // TODO: switch these to unique_ptr
     std::unordered_map<CFGBlock*, SymbolTable*> ending_symbol_tables;
     std::unordered_map<CFGBlock*, ConcreteSymbolTable*> phi_ending_symbol_tables;
-    typedef std::unordered_map<std::string, std::pair<ConcreteCompilerType*, llvm::PHINode*> > PHITable;
+    std::unordered_map<CFGBlock*, DefinednessTable*> definedness_tables;
+    typedef VRegMap<std::pair<ConcreteCompilerType*, llvm::PHINode*>> PHITable;
+    typedef VRegMap<llvm::PHINode*> DefinednessPHITable;
     std::unordered_map<CFGBlock*, PHITable*> created_phis;
+    std::unordered_map<CFGBlock*, DefinednessPHITable*> created_definedness_phis;
+    std::unordered_map<CFGBlock*, llvm::SmallVector<IRGenerator::ExceptionState, 2>> incoming_exception_state;
 
     CFGBlock* initial_block = NULL;
     if (entry_descriptor) {
         initial_block = entry_descriptor->backedge->target;
-    } else if (full_blocks.count(source->cfg->getStartingBlock())) {
-        initial_block = source->cfg->getStartingBlock();
+    } else if (blocks.count(cfg->getStartingBlock())) {
+        initial_block = cfg->getStartingBlock();
     }
 
     // The rest of this code assumes that for each non-entry block that gets evaluated,
@@ -487,84 +562,67 @@ static void emitBBs(IRGenState* irstate, const char* bb_type, GuardList& out_gua
     // with a lower index value, so if the entry block is 0 then we can iterate in index
     // order.
     // The entry block doesn't have to be zero, so we have to calculate an allowable order here:
-    std::vector<std::pair<CFGBlock*, CFGBlock*> > traversal_order
-        = computeBlockTraversalOrder(full_blocks, partial_blocks, initial_block);
+    std::vector<std::pair<CFGBlock*, CFGBlock*>> traversal_order = computeBlockTraversalOrder(blocks, initial_block);
 
     std::unordered_set<CFGBlock*> into_hax;
     for (int _i = 0; _i < traversal_order.size(); _i++) {
         CFGBlock* block = traversal_order[_i].first;
         CFGBlock* pred = traversal_order[_i].second;
 
-        if (VERBOSITY("irgen") >= 1)
-            printf("processing %s block %d\n", bb_type, block->idx);
-
-        bool is_partial = false;
-        if (partial_blocks.count(block)) {
-            if (VERBOSITY("irgen") >= 1)
-                printf("is partial block\n");
-            is_partial = true;
-        } else if (!full_blocks.count(block)) {
-            if (VERBOSITY("irgen") >= 1)
-                printf("Skipping this block\n");
-            // created_phis[block] = NULL;
-            // ending_symbol_tables[block] = NULL;
-            // phi_ending_symbol_tables[block] = NULL;
-            // llvm_exit_blocks[block] = NULL;
+        if (!blocks.count(block))
             continue;
-        }
 
-        std::unique_ptr<IRGenerator> generator(
-            createIRGenerator(irstate, llvm_entry_blocks, block, types, out_guards, in_guards, is_partial));
+        if (VERBOSITY("irgen") >= 2)
+            printf("processing block %d\n", block->idx);
+
+        std::unique_ptr<IRGenerator> generator(createIRGenerator(irstate, llvm_entry_blocks, block, types));
         llvm::BasicBlock* entry_block_end = llvm_entry_blocks[block];
         std::unique_ptr<IREmitter> emitter(createIREmitter(irstate, entry_block_end));
 
-        PHITable* phis = NULL;
-        if (!is_partial) {
-            phis = new PHITable();
-            created_phis[block] = phis;
-        }
+        PHITable* phis = new PHITable(num_vregs);
+        created_phis[block] = phis;
+        DefinednessPHITable* definedness_phis = new DefinednessPHITable(num_vregs);
+        created_definedness_phis[block] = definedness_phis;
 
         // Set initial symbol table:
-        if (is_partial) {
-            // pass
-        } else if (block == source->cfg->getStartingBlock()) {
+        // If we're in the starting block, no phis or symbol table changes for us.
+        // Generate function entry code instead.
+        if (block == cfg->getStartingBlock()) {
             assert(entry_descriptor == NULL);
-            // number of times a function needs to be called to be reoptimized:
-            static const int REOPT_THRESHOLDS[] = {
-                10,    // INTERPRETED->MINIMAL
-                250,   // MINIMAL->MODERATE
-                10000, // MODERATE->MAXIMAL
-            };
 
-            assert(strcmp("opt", bb_type) == 0);
-
-            if (ENABLE_REOPT && effort < EffortLevel::MAXIMAL && source->ast != NULL
-                && source->ast->type != AST_TYPE::Module) {
-                llvm::BasicBlock* preentry_bb
-                    = llvm::BasicBlock::Create(g.context, "pre_entry", irstate->getLLVMFunction(),
-                                               llvm_entry_blocks[source->cfg->getStartingBlock()]);
+            if (ENABLE_REOPT && effort < EffortLevel::MAXIMAL && source->ast_type != AST_TYPE::Module) {
+                llvm::BasicBlock* preentry_bb = llvm::BasicBlock::Create(
+                    g.context, "pre_entry", irstate->getLLVMFunction(), llvm_entry_blocks[cfg->getStartingBlock()]);
                 llvm::BasicBlock* reopt_bb = llvm::BasicBlock::Create(g.context, "reopt", irstate->getLLVMFunction());
                 emitter->getBuilder()->SetInsertPoint(preentry_bb);
 
-                llvm::Value* call_count_ptr = embedConstantPtr(&cf->times_called, g.i64->getPointerTo());
+                llvm::Value* call_count_ptr = embedRelocatablePtr(&cf->times_called, g.i64->getPointerTo());
                 llvm::Value* cur_call_count = emitter->getBuilder()->CreateLoad(call_count_ptr);
                 llvm::Value* new_call_count
                     = emitter->getBuilder()->CreateAdd(cur_call_count, getConstantInt(1, g.i64));
                 emitter->getBuilder()->CreateStore(new_call_count, call_count_ptr);
-                llvm::Value* reopt_test = emitter->getBuilder()->CreateICmpSGT(
-                    new_call_count, getConstantInt(REOPT_THRESHOLDS[effort], g.i64));
 
-                llvm::Value* md_vals[]
-                    = { llvm::MDString::get(g.context, "branch_weights"), getConstantInt(1), getConstantInt(1000) };
-                llvm::MDNode* branch_weights = llvm::MDNode::get(g.context, llvm::ArrayRef<llvm::Value*>(md_vals));
+                int reopt_threshold;
+                if (effort == EffortLevel::MODERATE)
+                    reopt_threshold = REOPT_THRESHOLD_T2;
+                else
+                    RELEASE_ASSERT(0, "Unknown effort: %d", (int)effort);
+
+                llvm::Value* reopt_test
+                    = emitter->getBuilder()->CreateICmpSGT(new_call_count, getConstantInt(reopt_threshold, g.i64));
+
+                llvm::Metadata* md_vals[] = { llvm::MDString::get(g.context, "branch_weights"),
+                                              llvm::ConstantAsMetadata::get(getConstantInt(1)),
+                                              llvm::ConstantAsMetadata::get(getConstantInt(1000)) };
+                llvm::MDNode* branch_weights = llvm::MDNode::get(g.context, llvm::ArrayRef<llvm::Metadata*>(md_vals));
 
                 llvm::BranchInst* guard = emitter->getBuilder()->CreateCondBr(
-                    reopt_test, reopt_bb, llvm_entry_blocks[source->cfg->getStartingBlock()], branch_weights);
+                    reopt_test, reopt_bb, llvm_entry_blocks[cfg->getStartingBlock()], branch_weights);
 
                 emitter->getBuilder()->SetInsertPoint(reopt_bb);
                 // emitter->getBuilder()->CreateCall(g.funcs.my_assert, getConstantInt(0, g.i1));
                 llvm::Value* r = emitter->getBuilder()->CreateCall(g.funcs.reoptCompiledFunc,
-                                                                   embedConstantPtr(cf, g.i8->getPointerTo()));
+                                                                   embedRelocatablePtr(cf, g.i8->getPointerTo()));
                 assert(r);
                 assert(r->getType() == g.i8->getPointerTo());
 
@@ -580,39 +638,48 @@ static void emitBBs(IRGenState* irstate, const char* bb_type, GuardList& out_gua
                 // printf("%ld\n", args.size());
                 llvm::CallInst* postcall = emitter->getBuilder()->CreateCall(bitcast_r, args);
                 postcall->setTailCall(true);
-                if (rtn_type == VOID) {
-                    emitter->getBuilder()->CreateRetVoid();
-                } else {
-                    emitter->getBuilder()->CreateRet(postcall);
-                }
+                emitter->getBuilder()->CreateRet(postcall);
 
-                emitter->getBuilder()->SetInsertPoint(llvm_entry_blocks[source->cfg->getStartingBlock()]);
+                emitter->getBuilder()->SetInsertPoint(llvm_entry_blocks[cfg->getStartingBlock()]);
             }
 
-            generator->doFunctionEntry(source->arg_names, cf->spec->arg_types);
+            generator->doFunctionEntry(*irstate->getParamNames(), cf->spec->arg_types);
 
             // Function-entry safepoint:
             // TODO might be more efficient to do post-call safepoints?
-            generator->doSafePoint();
+            generator->doSafePoint(block->body());
         } else if (entry_descriptor && block == entry_descriptor->backedge->target) {
             assert(block->predecessors.size() > 1);
             assert(osr_entry_block);
             assert(phis);
 
+            irstate->setupFrameInfoVarOSR(osr_frame_info_arg);
+
+            for (const auto& vreg : entry_descriptor->potentially_undefined) {
+                llvm::PHINode* phi = emitter->getBuilder()->CreatePHI(BOOL->llvmType(), block->predecessors.size() + 1);
+                generator->giveDefinednessVar(vreg, phi);
+                (*definedness_phis)[vreg] = phi;
+            }
             for (const auto& p : entry_descriptor->args) {
+                int vreg = p.first;
+
                 ConcreteCompilerType* analyzed_type = getTypeAtBlockStart(types, p.first, block);
 
                 // printf("For %s, given %s, analyzed for %s\n", p.first.c_str(), p.second->debugName().c_str(),
-                // analyzed_type->debugName().c_str());
+                //        analyzed_type->debugName().c_str());
 
-                llvm::PHINode* phi = emitter->getBuilder()->CreatePHI(analyzed_type->llvmType(),
-                                                                      block->predecessors.size() + 1, p.first);
-                ConcreteCompilerVariable* var = new ConcreteCompilerVariable(analyzed_type, phi, true);
-                generator->giveLocalSymbol(p.first, var);
-                (*phis)[p.first] = std::make_pair(analyzed_type, phi);
+                llvm::PHINode* phi
+                    = emitter->getBuilder()->CreatePHI(analyzed_type->llvmType(), block->predecessors.size() + 1);
+                if (analyzed_type->getBoxType() == analyzed_type) {
+                    irstate->getRefcounts()->setType(phi, RefType::OWNED);
+                }
+
+                ConcreteCompilerVariable* var = new ConcreteCompilerVariable(analyzed_type, phi);
+                generator->giveLocalSymbol(vreg, var);
+                (*phis)[vreg] = std::make_pair(analyzed_type, phi);
             }
         } else if (pred == NULL) {
-            assert(traversal_order.size() < source->cfg->blocks.size());
+            assert(traversal_order.size() < cfg->blocks.size());
             assert(phis);
             assert(block->predecessors.size());
             for (int i = 0; i < block->predecessors.size(); i++) {
@@ -621,64 +688,70 @@ static void emitBBs(IRGenState* irstate, const char* bb_type, GuardList& out_gua
                 into_hax.insert(b2);
             }
 
-            const PhiAnalysis::RequiredSet& names = source->phis->getAllRequiredFor(block);
-            for (const auto& s : names) {
-                // printf("adding guessed phi for %s\n", s.c_str());
-                ConcreteCompilerType* type = types->getTypeAtBlockStart(s, block);
-                llvm::PHINode* phi = emitter->getBuilder()->CreatePHI(type->llvmType(), block->predecessors.size(), s);
-                ConcreteCompilerVariable* var = new ConcreteCompilerVariable(type, phi, true);
-                generator->giveLocalSymbol(s, var);
 
-                (*phis)[s] = std::make_pair(type, phi);
+            RELEASE_ASSERT(0, "Rotted code");
+#if 0
+            std::set<InternedString> names;
+            for (const int vreg : phi_analysis->getAllRequiredFor(block)) {
+                auto s = cfg->getVRegInfo().getName(vreg);
+                names.insert(s);
 
-                if (source->phis->isPotentiallyUndefinedAfter(s, block->predecessors[0])) {
-                    std::string is_defined_name = "!is_defined_" + s;
-                    llvm::PHINode* phi = emitter->getBuilder()->CreatePHI(BOOL->llvmType(), block->predecessors.size(),
-                                                                          is_defined_name);
-                    ConcreteCompilerVariable* var = new ConcreteCompilerVariable(BOOL, phi, true);
-                    generator->giveLocalSymbol(is_defined_name, var);
-
-                    (*phis)[is_defined_name] = std::make_pair(BOOL, phi);
+                if (phi_analysis->isPotentiallyUndefinedAfter(vreg, block->predecessors[0])) {
+                    assert(0 && "this should go in definedness_names or some such");
+                    names.insert(getIsDefinedName(s, source->getInternedStrings()));
                 }
             }
+
+            for (const InternedString& s : names) {
+                // printf("adding guessed phi for %s\n", s.c_str());
+                ConcreteCompilerType* type = getTypeAtBlockStart(types, s, block);
+                llvm::PHINode* phi
+                    = emitter->getBuilder()->CreatePHI(type->llvmType(), block->predecessors.size(), s.s());
+                if (type->getBoxType() == type) {
+                    RefType type = shouldPhisOwnThisSym(s.s()) ? RefType::OWNED : RefType::BORROWED;
+                    irstate->getRefcounts()->setType(phi, type);
+                }
+                ConcreteCompilerVariable* var = new ConcreteCompilerVariable(type, phi);
+                generator->giveLocalSymbol(s, var);
+
+                assert(s.s()[0] != '!' && "implement me");
+
+                (*phis)[s] = std::make_pair(type, phi);
+            }
+#endif
         } else {
             assert(pred);
-            assert(full_blocks.count(pred) || partial_blocks.count(pred));
+            assert(blocks.count(pred));
 
             if (block->predecessors.size() == 1) {
                 // If this block has only one predecessor, it by definition doesn't need any phi nodes.
                 // Assert that the phi_st is empty, and just create the symbol table from the non-phi st:
-                ASSERT(phi_ending_symbol_tables[pred]->size() == 0, "%d %d", block->idx, pred->idx);
+                ASSERT(phi_ending_symbol_tables[pred]->numSet() == 0, "%d %d", block->idx, pred->idx);
                 assert(ending_symbol_tables.count(pred));
 
-                // Filter out any names set by an invoke statement at the end
-                // of the previous block, if we're in the unwind path.
-                // This definitely doesn't seem like the most elegant way to do this,
-                // but the rest of the analysis frameworks can't (yet) support the idea of
-                // a block flowing differently to its different predecessors.
+                // Filter out any names set by an invoke statement at the end of the previous block, if we're in the
+                // unwind path. This definitely doesn't seem like the most elegant way to do this, but the rest of the
+                // analysis frameworks can't (yet) support the idea of a block flowing differently to its different
+                // successors.
+                //
+                // We only need to do this in the case that we have exactly one predecessor, because:
+                // - a block ending in an invoke will have multiple successors
+                // - critical edges (block with multiple successors -> block with multiple predecessors)
+                //   are disallowed
+
                 auto pred = block->predecessors[0];
-                auto last_inst = pred->body.back();
+                auto last_inst = pred->getTerminator();
 
                 SymbolTable* sym_table = ending_symbol_tables[pred];
                 bool created_new_sym_table = false;
-                if (last_inst->type == AST_TYPE::Invoke) {
-                    auto invoke = ast_cast<AST_Invoke>(last_inst);
-                    if (invoke->exc_dest == block && invoke->stmt->type == AST_TYPE::Assign) {
-                        auto asgn = ast_cast<AST_Assign>(invoke->stmt);
-                        assert(asgn->targets.size() == 1);
-                        if (asgn->targets[0]->type == AST_TYPE::Name) {
-                            auto name = ast_cast<AST_Name>(asgn->targets[0]);
-
-                            // TODO: inneficient
-                            sym_table = new SymbolTable(*sym_table);
-                            assert(sym_table->count(name->id));
-                            sym_table->erase(name->id);
-                            created_new_sym_table = true;
-                        }
-                    }
-                }
+                if (last_inst->is_invoke() && last_inst->get_exc_block() == block)
+                    std::tie(sym_table, created_new_sym_table) = SymTableDstVRegDeleter::removeDestVRegsFromSymTable(
+                        irstate->getCodeConstants(), sym_table, last_inst);
 
                 generator->copySymbolsFrom(sym_table);
+                for (auto&& p : *definedness_tables[pred]) {
+                    generator->giveDefinednessVar(p.first, p.second);
+                }
                 if (created_new_sym_table)
                     delete sym_table;
             } else {
@@ -690,225 +763,204 @@ static void emitBBs(IRGenState* irstate, const char* bb_type, GuardList& out_gua
                 // Start off with the non-phi ones:
                 generator->copySymbolsFrom(ending_symbol_tables[pred]);
 
+                // NB. This is where most `typical' phi nodes get added.
                 // And go through and add phi nodes:
                 ConcreteSymbolTable* pred_st = phi_ending_symbol_tables[pred];
-                for (ConcreteSymbolTable::iterator it = pred_st->begin(); it != pred_st->end(); it++) {
-                    // printf("adding phi for %s\n", it->first.c_str());
-                    llvm::PHINode* phi = emitter->getBuilder()->CreatePHI(it->second->getType()->llvmType(),
-                                                                          block->predecessors.size(), it->first);
-                    // emitter->getBuilder()->CreateCall(g.funcs.dump, phi);
-                    ConcreteCompilerVariable* var = new ConcreteCompilerVariable(it->second->getType(), phi, true);
-                    generator->giveLocalSymbol(it->first, var);
 
-                    (*phis)[it->first] = std::make_pair(it->second->getType(), phi);
+                for (int vreg = 0; vreg < num_vregs; vreg++) {
+                    ConcreteCompilerVariable* cv = (*pred_st)[vreg];
+                    if (!cv)
+                        continue;
+
+                    llvm::PHINode* phi
+                        = emitter->getBuilder()->CreatePHI(cv->getType()->llvmType(), block->predecessors.size());
+                    if (VERBOSITY("irgen"))
+                        phi->setName(vreg_info.getName(vreg).s());
+
+                    if (cv->getType()->getBoxType() == cv->getType()) {
+                        irstate->getRefcounts()->setType(phi, RefType::OWNED);
+                    }
+                    // emitter->getBuilder()->CreateCall(g.funcs.dump, phi);
+                    ConcreteCompilerVariable* var = new ConcreteCompilerVariable(cv->getType(), phi);
+                    generator->giveLocalSymbol(vreg, var);
+
+                    (*phis)[vreg] = std::make_pair(cv->getType(), phi);
+                }
+
+                for (auto&& p : *definedness_tables[pred]) {
+                    llvm::PHINode* phi = emitter->getBuilder()->CreatePHI(BOOL->llvmType(), block->predecessors.size());
+                    if (VERBOSITY("irgen"))
+                        phi->setName("!is_defined_" + vreg_info.getName(p.first).s());
+                    generator->giveDefinednessVar(p.first, phi);
+                    (*definedness_phis)[p.first] = phi;
                 }
             }
         }
 
+        auto exc_it = incoming_exception_state.find(block);
+        if (exc_it != incoming_exception_state.end()) {
+            generator->setIncomingExceptionState(exc_it->second);
+        }
+
+        // Generate loop safepoints on backedges.
         for (CFGBlock* predecessor : block->predecessors) {
             if (predecessor->idx > block->idx) {
                 // Loop safepoint:
                 // TODO does it matter which side of the backedge these are on?
-                generator->doSafePoint();
+                generator->doSafePoint(block->body());
                 break;
             }
         }
 
+        // Generate the IR for the block.
         generator->run(block);
 
         const IRGenerator::EndingState& ending_st = generator->getEndingSymbolTable();
         ending_symbol_tables[block] = ending_st.symbol_table;
         phi_ending_symbol_tables[block] = ending_st.phi_symbol_table;
+        definedness_tables[block] = ending_st.definedness_vars;
         llvm_exit_blocks[block] = ending_st.ending_block;
 
+        if (ending_st.exception_state.size()) {
+            BST_stmt* last_stmt = block->getTerminator();
+            assert(last_stmt->is_invoke());
+            CFGBlock* exc_block = last_stmt->get_exc_block();
+            assert(!incoming_exception_state.count(exc_block));
+
+            incoming_exception_state.insert(std::make_pair(exc_block, ending_st.exception_state));
+        }
+
         if (into_hax.count(block))
-            ASSERT(ending_st.symbol_table->size() == 0, "%d", block->idx);
+            ASSERT(ending_st.symbol_table->numSet() == 0, "%d", block->idx);
     }
 
     ////
-    // Phi generation.
+    // Phi population.
     // We don't know the exact ssa values to back-propagate to the phi nodes until we've generated
     // the relevant IR, so after we have done all of it, go back through and populate the phi nodes.
     // Also, do some checking to make sure that the phi analysis stuff worked out, and that all blocks
     // agreed on what symbols + types they should be propagating for the phis.
-    for (CFGBlock* b : source->cfg->blocks) {
+    for (CFGBlock* b : cfg->blocks) {
         PHITable* phis = created_phis[b];
         if (phis == NULL)
             continue;
 
         bool this_is_osr_entry = (entry_descriptor && b == entry_descriptor->backedge->target);
 
-        const std::vector<GuardList::BlockEntryGuard*>& block_guards = in_guards.getGuardsForBlock(b);
-        // printf("Found %ld guards for block %p, for %p\n", block_guards.size(), b, &in_guards);
-
+#ifndef NDEBUG
+        // Check to see that all blocks agree on what symbols + types they should be propagating for phis.
         for (int j = 0; j < b->predecessors.size(); j++) {
-            CFGBlock* b2 = b->predecessors[j];
-            if (full_blocks.count(b2) == 0 && partial_blocks.count(b2) == 0)
+            CFGBlock* bpred = b->predecessors[j];
+            if (blocks.count(bpred) == 0)
                 continue;
 
-            // printf("%d %d %ld %ld\n", i, b2->idx, phi_ending_symbol_tables[b2]->size(), phis->size());
-            compareKeyset(phi_ending_symbol_tables[b2], phis);
-            assert(phi_ending_symbol_tables[b2]->size() == phis->size());
+            auto terminator = llvm_exit_blocks[b->predecessors[j]]->getTerminator();
+            if (llvm::isa<llvm::UnreachableInst>(terminator))
+                continue;
+
+            // printf("(%d %ld) -> (%d %ld)\n", bpred->idx, phi_ending_symbol_tables[bpred]->size(), b->idx,
+            // phis->size());
+            ASSERT(sameKeyset(phi_ending_symbol_tables[bpred], phis), "%d->%d", bpred->idx, b->idx);
+            assert(phi_ending_symbol_tables[bpred]->numSet() == phis->numSet());
         }
 
         if (this_is_osr_entry) {
-            compareKeyset(osr_syms, phis);
+            assert(osr_syms.numSet() == phis->numSet());
         }
+#endif // end checking phi agreement.
 
-        std::vector<IREmitter*> emitters;
-        std::vector<llvm::BasicBlock*> offramps;
-        for (int i = 0; i < block_guards.size(); i++) {
-            compareKeyset(&block_guards[i]->symbol_table, phis);
-
-            llvm::BasicBlock* off_ramp = llvm::BasicBlock::Create(g.context, "deopt_ramp", irstate->getLLVMFunction());
-            offramps.push_back(off_ramp);
-            llvm::BasicBlock* off_ramp_end = off_ramp;
-            IREmitter* emitter = createIREmitter(irstate, off_ramp_end);
-            emitters.push_back(emitter);
-
-            block_guards[i]->branch->setSuccessor(1, off_ramp);
-        }
-
-        for (PHITable::iterator it = phis->begin(); it != phis->end(); it++) {
-            llvm::PHINode* llvm_phi = it->second.second;
+        auto handle_phi = [&](llvm::PHINode* llvm_phi, int vreg, CompilerType* phi_type, bool is_defined_name) {
             for (int j = 0; j < b->predecessors.size(); j++) {
-                CFGBlock* b2 = b->predecessors[j];
-                if (full_blocks.count(b2) == 0 && partial_blocks.count(b2) == 0)
+                CFGBlock* bpred = b->predecessors[j];
+                if (blocks.count(bpred) == 0)
                     continue;
 
-                ConcreteCompilerVariable* v = (*phi_ending_symbol_tables[b2])[it->first];
-                assert(v);
-                assert(v->isGrabbed());
+                auto terminator = llvm_exit_blocks[b->predecessors[j]]->getTerminator();
+                if (llvm::isa<llvm::UnreachableInst>(terminator))
+                    continue;
 
-                // Make sure they all prepared for the same type:
-                ASSERT(it->second.first == v->getType(), "%d %d: %s %s %s", b->idx, b2->idx, it->first.c_str(),
-                       it->second.first->debugName().c_str(), v->getType()->debugName().c_str());
+                llvm::Value* val;
+                CompilerType* this_type;
+                if (!is_defined_name) {
+                    ConcreteCompilerVariable* v = (*phi_ending_symbol_tables[bpred])[vreg];
+                    assert(v);
 
-                llvm_phi->addIncoming(v->getValue(), llvm_exit_blocks[b->predecessors[j]]);
+                    // Make sure they all prepared for the same type:
+                    ASSERT(phi_type == v->getType(), "%d %d: %d %s %s", b->idx, bpred->idx, vreg,
+                           phi_type->debugName().c_str(), v->getType()->debugName().c_str());
+                    val = v->getValue();
+                    this_type = v->getType();
+                } else {
+                    val = (*definedness_tables[bpred])[vreg];
+                    this_type = BOOL;
+                }
+                assert(val);
+                llvm_phi->addIncoming(val, llvm_exit_blocks[b->predecessors[j]]);
+
+                if (this_type->getBoxType() == this_type) {
+                    // llvm::outs() << *v->getValue() << " is getting consumed by phi " << *llvm_phi << '\n';
+                    assert(llvm::isa<llvm::BranchInst>(terminator));
+                    irstate->getRefcounts()->refConsumed(val, terminator);
+                }
             }
 
             if (this_is_osr_entry) {
-                ConcreteCompilerVariable* v = (*osr_syms)[it->first];
-                assert(v);
-                assert(v->isGrabbed());
-
-                ASSERT(it->second.first == v->getType(), "");
-                llvm_phi->addIncoming(v->getValue(), osr_unbox_block);
-            }
-
-            for (int i = 0; i < block_guards.size(); i++) {
-                GuardList::BlockEntryGuard* guard = block_guards[i];
-                IREmitter* emitter = emitters[i];
-
-                ASSERT(phis->count("!is_defined_" + it->first) == 0,
-                       "This class-check-creating behavior will segfault if the argument wasn't actually defined!");
-
-                CompilerVariable* unconverted = guard->symbol_table[it->first];
-                ConcreteCompilerVariable* v;
-                if (unconverted->canConvertTo(it->second.first)) {
-                    v = unconverted->makeConverted(*emitter, it->second.first);
+                if (!is_defined_name) {
+                    ConcreteCompilerVariable* v = osr_syms[vreg];
                     assert(v);
-                    assert(v->isGrabbed());
+                    ASSERT(v->getType() == phi_type, "");
+                    llvm_phi->addIncoming(v->getValue(), osr_unbox_block_end);
                 } else {
-                    // This path is for handling the case that we did no type analysis in the previous tier,
-                    // but in this tier we know that even in the deopt branch with no speculations, that
-                    // the type is more refined than what we got from the previous tier.
-                    //
-                    // We're going to blindly assume that we're right about what the type should be.
-                    assert(unconverted->getType() == UNKNOWN);
-                    assert(strcmp(bb_type, "deopt") == 0);
-
-                    ConcreteCompilerVariable* converted = unconverted->makeConverted(*emitter, UNKNOWN);
-
-                    if (it->second.first->llvmType() == g.llvm_value_type_ptr) {
-                        v = new ConcreteCompilerVariable(it->second.first, converted->getValue(), true);
-                    } else if (it->second.first == FLOAT) {
-                        llvm::Value* unboxed
-                            = emitter->getBuilder()->CreateCall(g.funcs.unboxFloat, converted->getValue());
-                        v = new ConcreteCompilerVariable(FLOAT, unboxed, true);
-                    } else if (it->second.first == INT) {
-                        llvm::Value* unboxed
-                            = emitter->getBuilder()->CreateCall(g.funcs.unboxInt, converted->getValue());
-                        v = new ConcreteCompilerVariable(INT, unboxed, true);
-                    } else {
-                        printf("%s\n", it->second.first->debugName().c_str());
-                        abort();
-                    }
-
-                    converted->decvref(*emitter);
-
-                    /*
-                    if (speculated_class == int_cls) {
-                        v = unbox_emitter->getBuilder()->CreateCall(g.funcs.unboxInt, from_arg);
-                        (new ConcreteCompilerVariable(BOXED_INT, from_arg, true))->decvref(*unbox_emitter);
-                    } else if (speculated_class == float_cls) {
-                        v = unbox_emitter->getBuilder()->CreateCall(g.funcs.unboxFloat, from_arg);
-                        (new ConcreteCompilerVariable(BOXED_FLOAT, from_arg, true))->decvref(*unbox_emitter);
-                    } else {
-                        assert(phi_type == typeFromClass(speculated_class));
-                        v = from_arg;
-                    }
-                    */
+                    llvm::Value* v = osr_definedness[vreg];
+                    assert(v);
+                    llvm_phi->addIncoming(v, osr_unbox_block_end);
                 }
-
-
-                ASSERT(it->second.first == v->getType(), "");
-                assert(it->second.first->llvmType() == v->getValue()->getType());
-                llvm_phi->addIncoming(v->getValue(), offramps[i]);
-
-                // TODO not sure if this is right:
-                unconverted->decvref(*emitter);
-                delete v;
             }
+        };
+
+        for (auto it = phis->begin(); it != phis->end(); ++it) {
+            llvm::PHINode* llvm_phi = it.second().second;
+
+            handle_phi(llvm_phi, it.first(), it.second().first, false);
         }
 
-        for (int i = 0; i < block_guards.size(); i++) {
-            emitters[i]->getBuilder()->CreateBr(llvm_entry_blocks[b]);
-            delete emitters[i];
+        auto definedness_phis = created_definedness_phis[b];
+        for (auto it = definedness_phis->begin(); it != definedness_phis->end(); ++it) {
+            llvm::PHINode* llvm_phi = it.second();
+
+            handle_phi(llvm_phi, it.first(), BOOL, true);
         }
     }
 
-    for (CFGBlock* b : source->cfg->blocks) {
+    // deallocate/dereference memory
+    for (CFGBlock* b : cfg->blocks) {
         if (ending_symbol_tables[b] == NULL)
             continue;
 
-        for (SymbolTable::iterator it = ending_symbol_tables[b]->begin(); it != ending_symbol_tables[b]->end(); it++) {
-            it->second->decvrefNodrop();
-        }
-        for (ConcreteSymbolTable::iterator it = phi_ending_symbol_tables[b]->begin();
-             it != phi_ending_symbol_tables[b]->end(); it++) {
-            it->second->decvrefNodrop();
-        }
-        delete phi_ending_symbol_tables[b];
         delete ending_symbol_tables[b];
+        delete phi_ending_symbol_tables[b];
         delete created_phis[b];
+        delete definedness_tables[b];
     }
 
     if (entry_descriptor) {
-        for (const auto& p : *osr_syms) {
+        for (const auto& p : osr_syms) {
             delete p.second;
         }
-        delete osr_syms;
     }
 }
 
-static void computeBlockSetClosure(BlockSet& full_blocks, BlockSet& partial_blocks) {
-    if (VERBOSITY("irgen") >= 1) {
-        printf("Initial full:");
-        for (CFGBlock* b : full_blocks) {
-            printf(" %d", b->idx);
-        }
-        printf("\n");
-        printf("Initial partial:");
-        for (CFGBlock* b : partial_blocks) {
+static void computeBlockSetClosure(BlockSet& blocks) {
+    if (VERBOSITY("irgen") >= 2) {
+        printf("Initial:");
+        for (CFGBlock* b : blocks) {
             printf(" %d", b->idx);
         }
         printf("\n");
     }
     std::vector<CFGBlock*> q;
     BlockSet expanded;
-    q.insert(q.end(), full_blocks.begin(), full_blocks.end());
-    q.insert(q.end(), partial_blocks.begin(), partial_blocks.end());
+    q.insert(q.end(), blocks.begin(), blocks.end());
 
     while (q.size()) {
         CFGBlock* b = q.back();
@@ -918,114 +970,105 @@ static void computeBlockSetClosure(BlockSet& full_blocks, BlockSet& partial_bloc
             continue;
         expanded.insert(b);
 
-        for (int i = 0; i < b->successors.size(); i++) {
-            CFGBlock* b2 = b->successors[i];
-            partial_blocks.erase(b2);
-            full_blocks.insert(b2);
+        for (CFGBlock* b2 : b->successors()) {
+            blocks.insert(b2);
             q.push_back(b2);
         }
     }
 
-    if (VERBOSITY("irgen") >= 1) {
-        printf("Ending full:");
-        for (CFGBlock* b : full_blocks) {
-            printf(" %d", b->idx);
-        }
-        printf("\n");
-        printf("Ending partial:");
-        for (CFGBlock* b : partial_blocks) {
+    if (VERBOSITY("irgen") >= 2) {
+        printf("Ending:");
+        for (CFGBlock* b : blocks) {
             printf(" %d", b->idx);
         }
         printf("\n");
     }
 }
 // returns a pointer to the function-info mdnode
-static llvm::MDNode* setupDebugInfo(SourceInfo* source, llvm::Function* f, std::string origname) {
-    int lineno = 0;
-    if (source->ast)
-        lineno = source->ast->lineno;
+static llvm::MDNode* setupDebugInfo(BoxedCode* code, llvm::Function* f, std::string origname) {
+    int lineno = code->firstlineno;
 
     llvm::DIBuilder builder(*g.cur_module);
 
-    std::string fn = source->parent_module->fn;
+    BoxedString* fn = code->filename;
     std::string dir = "";
     std::string producer = "pyston; git rev " STRINGIFY(GITREV);
 
-    llvm::DIFile file = builder.createFile(fn, dir);
-#if LLVMREV < 214132
-    llvm::DIArray param_types = builder.getOrCreateArray(llvm::None);
-#else
+    llvm::DIFile file = builder.createFile(fn->s(), dir);
     llvm::DITypeArray param_types = builder.getOrCreateTypeArray(llvm::None);
-#endif
     llvm::DICompositeType func_type = builder.createSubroutineType(file, param_types);
     llvm::DISubprogram func_info = builder.createFunction(file, f->getName(), f->getName(), file, lineno, func_type,
                                                           false, true, lineno + 1, 0, true, f);
 
-    // The 'variables' field gets initialized with a tag-prefixed array, but
-    // a later verifier asserts that there is no tag.  Replace it with an empty array:
-    func_info.getVariables()->replaceAllUsesWith(builder.getOrCreateArray(llvm::ArrayRef<llvm::Value*>()));
-
     llvm::DICompileUnit compile_unit
-        = builder.createCompileUnit(llvm::dwarf::DW_LANG_Python, fn, dir, producer, true, "", 0);
+        = builder.createCompileUnit(llvm::dwarf::DW_LANG_Python, fn->s(), dir, producer, true, "", 0);
 
-    llvm::DIArray subprograms = builder.getOrCreateArray(&*func_info);
-    compile_unit.getSubprograms()->replaceAllUsesWith(subprograms);
-
-    compile_unit.getEnumTypes()->replaceAllUsesWith(builder.getOrCreateArray(llvm::ArrayRef<llvm::Value*>()));
-    compile_unit.getRetainedTypes()->replaceAllUsesWith(builder.getOrCreateArray(llvm::ArrayRef<llvm::Value*>()));
-    compile_unit.getGlobalVariables()->replaceAllUsesWith(builder.getOrCreateArray(llvm::ArrayRef<llvm::Value*>()));
-    compile_unit.getImportedEntities()->replaceAllUsesWith(builder.getOrCreateArray(llvm::ArrayRef<llvm::Value*>()));
+    builder.finalize();
     return func_info;
 }
 
-static std::string getUniqueFunctionName(std::string nameprefix, EffortLevel::EffortLevel effort,
-                                         const OSREntryDescriptor* entry) {
-    static int num_functions = 0;
-
-    std::ostringstream os;
+static std::string getUniqueFunctionName(std::string nameprefix, EffortLevel effort, const OSREntryDescriptor* entry) {
+    static llvm::StringMap<int> used_module_names;
+    std::string name;
+    llvm::raw_string_ostream os(name);
     os << nameprefix;
-    os << "_e" << effort;
-    if (entry) {
-        os << "_osr" << entry->backedge->target->idx << "_from_" << entry->cf->func->getName().data();
-    }
-    os << '_' << num_functions;
-    num_functions++;
+    os << "_e" << (int)effort;
+    if (entry)
+        os << "_osr" << entry->backedge->target->idx;
+    // in order to generate a unique id add the number of times we encountered this name to end of the string.
+    auto& times = used_module_names[os.str()];
+    os << '_' << ++times;
     return os.str();
 }
 
-CompiledFunction* doCompile(SourceInfo* source, const OSREntryDescriptor* entry_descriptor,
-                            EffortLevel::EffortLevel effort, FunctionSpecialization* spec, std::string nameprefix) {
+std::pair<CompiledFunction*, llvm::Function*> doCompile(BoxedCode* code, SourceInfo* source,
+                                                        const ParamNames* param_names,
+                                                        const OSREntryDescriptor* entry_descriptor, EffortLevel effort,
+                                                        ExceptionStyle exception_style, FunctionSpecialization* spec,
+                                                        llvm::StringRef nameprefix) {
     Timer _t("in doCompile");
     Timer _t2;
     long irgen_us = 0;
 
-    if (VERBOSITY("irgen") >= 1)
-        source->cfg->print();
+    assert((entry_descriptor != NULL) + (spec != NULL) == 1);
+
+    if (VERBOSITY("irgen") >= 2)
+        source->cfg->print(code->code_constants);
 
     assert(g.cur_module == NULL);
+
+    clearRelocatableSymsMap();
+
     std::string name = getUniqueFunctionName(nameprefix, effort, entry_descriptor);
     g.cur_module = new llvm::Module(name, g.context);
 #if LLVMREV < 217070 // not sure if this is the right rev
     g.cur_module->setDataLayout(g.tm->getDataLayout()->getStringRepresentation());
-#else
+#elif LLVMREV < 227113
     g.cur_module->setDataLayout(g.tm->getSubtargetImpl()->getDataLayout());
+#else
+    g.cur_module->setDataLayout(g.tm->getDataLayout());
 #endif
     // g.engine->addModule(g.cur_module);
 
     ////
     // Initializing the llvm-level structures:
 
-    int nargs = source->arg_names.totalParameters();
-    ASSERT(nargs == spec->arg_types.size(), "%d %ld", nargs, spec->arg_types.size());
-
 
     std::vector<llvm::Type*> llvm_arg_types;
     if (entry_descriptor == NULL) {
-        if (source->getScopeInfo()->takesClosure())
+        assert(spec);
+
+        int nargs = param_names->totalParameters();
+        ASSERT(nargs == spec->arg_types.size(), "%d %ld", nargs, spec->arg_types.size());
+
+        if (source->scoping.takesClosure())
             llvm_arg_types.push_back(g.llvm_closure_type_ptr);
 
-        if (source->getScopeInfo()->takesGenerator())
+        if (source->is_generator)
             llvm_arg_types.push_back(g.llvm_generator_type_ptr);
+
+        if (!source->scoping.areGlobalsFromModule())
+            llvm_arg_types.push_back(g.llvm_value_type_ptr);
 
         for (int i = 0; i < nargs; i++) {
             if (i == 3) {
@@ -1035,92 +1078,78 @@ CompiledFunction* doCompile(SourceInfo* source, const OSREntryDescriptor* entry_
             llvm_arg_types.push_back(spec->arg_types[i]->llvmType());
         }
     } else {
-        int arg_num = -1;
-        for (const auto& p : entry_descriptor->args) {
-            arg_num++;
-            // printf("Loading %s: %s\n", p.first.c_str(), p.second->debugName().c_str());
-            if (arg_num < 3)
-                llvm_arg_types.push_back(p.second->llvmType());
-            else {
-                llvm_arg_types.push_back(g.llvm_value_type_ptr->getPointerTo());
-                break;
-            }
-        }
+        // For simplicity, OSR entries always take all possible arguments:
+        llvm_arg_types.push_back(g.llvm_generator_type_ptr);
+        llvm_arg_types.push_back(g.llvm_closure_type_ptr);
+        llvm_arg_types.push_back(g.llvm_frame_info_type->getPointerTo());
+        llvm_arg_types.push_back(g.llvm_value_type_ptr->getPointerTo());
     }
 
-    llvm::FunctionType* ft = llvm::FunctionType::get(spec->rtn_type->llvmType(), llvm_arg_types, false /*vararg*/);
+    CompiledFunction* cf = new CompiledFunction(code, spec, NULL, effort, exception_style, entry_descriptor);
+
+    // Make sure that the instruction memory keeps the module object alive.
+    // TODO: implement this for real
+    // gc::registerPermanentRoot(source->parent_module, /* allow_duplicates= */ true);
+
+    llvm::FunctionType* ft = llvm::FunctionType::get(cf->getReturnType()->llvmType(), llvm_arg_types, false /*vararg*/);
 
     llvm::Function* f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, name, g.cur_module);
+
     // g.func_registry.registerFunction(f, g.cur_module);
 
-    CompiledFunction* cf
-        = new CompiledFunction(f, spec, (effort == EffortLevel::INTERPRETED), NULL, NULL, effort, entry_descriptor);
-
-    llvm::MDNode* dbg_funcinfo = setupDebugInfo(source, f, nameprefix);
+    llvm::MDNode* dbg_funcinfo = setupDebugInfo(code, f, nameprefix);
 
     irgen_us += _t2.split();
 
     TypeAnalysis::SpeculationLevel speculation_level = TypeAnalysis::NONE;
-    if (ENABLE_SPECULATION && effort >= EffortLevel::MODERATE)
+    EffortLevel min_speculation_level = EffortLevel::MODERATE;
+    if (ENABLE_SPECULATION && effort >= min_speculation_level)
         speculation_level = TypeAnalysis::SOME;
-    TypeAnalysis* types = doTypeAnalysis(source->cfg, source->arg_names, spec->arg_types, effort, speculation_level,
-                                         source->getScopeInfo());
+    TypeAnalysis* types;
+    if (entry_descriptor)
+        types = doTypeAnalysis(entry_descriptor, effort, speculation_level, code->code_constants);
+    else
+        types = doTypeAnalysis(source->cfg, *param_names, spec->arg_types, effort, speculation_level,
+                               code->code_constants);
+
 
     _t2.split();
 
-    GuardList guards;
-
-    BlockSet full_blocks, partial_blocks;
+    BlockSet blocks;
     if (entry_descriptor == NULL) {
         for (CFGBlock* b : source->cfg->blocks) {
-            full_blocks.insert(b);
+            blocks.insert(b);
         }
     } else {
-        full_blocks.insert(entry_descriptor->backedge->target);
-        computeBlockSetClosure(full_blocks, partial_blocks);
+        blocks.insert(entry_descriptor->backedge->target);
+        computeBlockSetClosure(blocks);
     }
 
-    IRGenState irstate(cf, source, getGCBuilder(), dbg_funcinfo);
+    LivenessAnalysis* liveness = source->getLiveness(code->code_constants);
+    std::unique_ptr<PhiAnalysis> phis;
 
-    emitBBs(&irstate, "opt", guards, GuardList(), types, entry_descriptor, full_blocks, partial_blocks);
+    if (entry_descriptor)
+        phis = computeRequiredPhis(entry_descriptor, liveness);
+    else
+        phis = computeRequiredPhis(*param_names, source->cfg, liveness);
 
-    // De-opt handling:
+    RefcountTracker refcounter;
 
-    if (!guards.isEmpty()) {
-        BlockSet deopt_full_blocks, deopt_partial_blocks;
-        GuardList deopt_guards;
-        // typedef std::unordered_map<CFGBlock*, std::unordered_map<AST_expr*, GuardList::ExprTypeGuard*> > Worklist;
-        // Worklist guard_worklist;
+    IRGenState irstate(code, cf, f, source, std::move(phis), param_names, getGCBuilder(), dbg_funcinfo, &refcounter);
 
-        guards.getBlocksWithGuards(deopt_full_blocks);
-        for (const auto& p : guards.exprGuards()) {
-            deopt_partial_blocks.insert(p.second->cfg_block);
-        }
+    emitBBs(&irstate, types, entry_descriptor, blocks);
+    assert(!llvm::verifyFunction(*f, &llvm::errs()));
 
-        computeBlockSetClosure(deopt_full_blocks, deopt_partial_blocks);
+    RefcountTracker::addRefcounts(&irstate);
+    assert(!llvm::verifyFunction(*f, &llvm::errs()));
 
-        assert(deopt_full_blocks.size() || deopt_partial_blocks.size());
-
-        irgen_us += _t2.split();
-        TypeAnalysis* deopt_types = doTypeAnalysis(source->cfg, source->arg_names, spec->arg_types, effort,
-                                                   TypeAnalysis::NONE, source->getScopeInfo());
-        _t2.split();
-
-        emitBBs(&irstate, "deopt", deopt_guards, guards, deopt_types, NULL, deopt_full_blocks, deopt_partial_blocks);
-        assert(deopt_guards.isEmpty());
-        deopt_guards.assertGotPatched();
-
-        delete deopt_types;
-    }
-    guards.assertGotPatched();
-
-    for (const auto& p : guards.exprGuards()) {
-        delete p.second;
-    }
+    int num_instructions = std::distance(llvm::inst_begin(f), llvm::inst_end(f));
+    static StatCounter num_llvm_insts("num_llvm_insts");
+    num_llvm_insts.log(num_instructions);
 
     delete types;
 
-    if (VERBOSITY("irgen") >= 1) {
+    if (VERBOSITY("irgen") >= 2) {
         printf("generated IR:\n");
         printf("\033[33m");
         fflush(stdout);
@@ -1136,31 +1165,26 @@ CompiledFunction* doCompile(SourceInfo* source, const OSREntryDescriptor* entry_
         // fflush(stdout);
     }
 
-#ifndef NDEBUG
-    if (!BENCH) {
-        // Calling verifyFunction() confuses the profiler, which will end up attributing
-        // a large amount of runtime to it since the call stack looks very similar to
-        // the (expensive) case of compiling the function.
-        llvm::verifyFunction(*f);
-    }
-#endif
-
     irgen_us += _t2.split();
     static StatCounter us_irgen("us_compiling_irgen");
     us_irgen.log(irgen_us);
 
-    if (ENABLE_LLVMOPTS)
-        optimizeIR(f, effort);
 
-    bool ENABLE_IR_DEBUG = false;
-    if (ENABLE_IR_DEBUG) {
-        addIRDebugSymbols(f);
-        // dumpPrettyIR(f);
+    // Calculate the module hash before doing any optimizations.
+    // This has the advantage that we can skip running the opt passes when we have cached object file
+    // but the disadvantage that optimizations are not allowed to add new symbolic constants...
+    if (ENABLE_JIT_OBJECT_CACHE) {
+        g.object_cache->calculateModuleHash(g.cur_module, effort);
+        if (ENABLE_LLVMOPTS && !g.object_cache->haveCacheFileForHash())
+            optimizeIR(f, effort);
+    } else {
+        if (ENABLE_LLVMOPTS)
+            optimizeIR(f, effort);
     }
 
     g.cur_module = NULL;
 
-    return cf;
+    return std::make_pair(cf, f);
 }
 
 

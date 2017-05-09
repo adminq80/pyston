@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,140 +15,87 @@
 #ifndef PYSTON_CORE_THREADING_H
 #define PYSTON_CORE_THREADING_H
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <ucontext.h>
 #include <vector>
+
+#include "Python.h"
 
 #include "core/common.h"
 #include "core/thread_utils.h"
 
 namespace pyston {
 class Box;
+class BoxedGenerator;
+
+#if ENABLE_SAMPLING_PROFILER
+extern int sigprof_pending;
+void _printStacktrace();
+#endif
+
+extern __thread PyThreadState cur_thread_state;
 
 namespace threading {
+
+// Whether or not a second thread was ever started:
+bool threadWasStarted();
 
 // returns a thread id (currently, the pthread_t id)
 intptr_t start_thread(void* (*start_func)(Box*, Box*, Box*), Box* arg1, Box* arg2, Box* arg3);
 
+// Hooks to tell the threading machinery about the main thread:
 void registerMainThread();
 void finishMainThread();
 
-struct ThreadState {
-    pid_t tid; // useful mostly for debugging
-    ucontext_t* ucontext;
+bool isMainThread();
 
-    // start and end (start < end) of the threads main stack.
-    // The thread may not be actually executing on that stack, since it may be
-    // in a generator, but those generators will be tracked separately.
-    void* stack_start, *stack_end;
+void _allowGLReadPreemption();
 
-    ThreadState(pid_t tid, ucontext_t* ucontext, void* stack_start, void* stack_end)
-        : tid(tid), ucontext(ucontext), stack_start(stack_start), stack_end(stack_end) {}
-};
-// Gets a ThreadState per thread, not including the thread calling this function.
-// For this call to make sense, the threads all should be blocked;
-// as a corollary, this thread is very much not thread safe.
-std::vector<ThreadState> getAllThreadStates();
+#define GIL_CHECK_INTERVAL 1000
 
-// Get the stack "bottom" (ie first pushed data.  For stacks that grow down, this
-// will be the highest address).
-void* getStackBottom();
-void* getStackTop();
-
-// We need to track the state of the thread's main stack.  This can get complicated when
-// generators are involved, so we add some hooks for the generator code to notify the threading
-// code that it has switched onto of off of a generator.
-// A generator should call pushGenerator() when it gets switched to, with a pointer to the context
-// that it will return to (ie the context of the thing that called the generator).
-// The generator should call popGenerator() when it is about to switch back to the caller.
-void pushGenerator(ucontext_t* prev_context);
-void popGenerator();
-
-
-#ifndef THREADING_USE_GIL
-#define THREADING_USE_GIL 1
-#define THREADING_USE_GRWL 0
-#endif
-#define THREADING_SAFE_DATASTRUCTURES THREADING_USE_GRWL
-
-#if THREADING_SAFE_DATASTRUCTURES
-#define DS_DEFINE_MUTEX(name) pyston::threading::PthreadFastMutex name
-
-#define DS_DECLARE_RWLOCK(name) extern pyston::threading::PthreadRWLock name
-#define DS_DEFINE_RWLOCK(name) pyston::threading::PthreadRWLock name
-
-#define DS_DEFINE_SPINLOCK(name) pyston::threading::PthreadSpinLock name
-#else
-#define DS_DEFINE_MUTEX(name) pyston::threading::NopLock name
-
-#define DS_DECLARE_RWLOCK(name) extern pyston::threading::NopLock name
-#define DS_DEFINE_RWLOCK(name) pyston::threading::NopLock name
-
-#define DS_DEFINE_SPINLOCK(name) pyston::threading::NopLock name
+// Note: this doesn't need to be an atomic, since it should
+// only be accessed by the thread that holds the gil:
+extern int gil_check_count;
+extern std::atomic<int> threads_waiting_on_gil;
+extern "C" inline void allowGLReadPreemption() __attribute__((visibility("default")));
+extern "C" inline void allowGLReadPreemption() {
+#if ENABLE_SAMPLING_PROFILER
+    if (unlikely(sigprof_pending)) {
+        // Output multiple stacktraces if we received multiple signals
+        // between being able to handle it (such as being in LLVM or the GC),
+        // to try to fully account for that time.
+        while (sigprof_pending) {
+            _printStacktrace();
+            sigprof_pending--;
+        }
+    }
 #endif
 
-void acquireGLRead();
-void releaseGLRead();
-void acquireGLWrite();
-void releaseGLWrite();
-void allowGLReadPreemption();
-// Note: promoteGL is free to drop the lock and then reacquire
-void promoteGL();
-void demoteGL();
+    // Double-checked locking: first read with no ordering constraint:
+    if (!threads_waiting_on_gil.load(std::memory_order_relaxed))
+        return;
+
+    gil_check_count++;
+    if (likely(gil_check_count < GIL_CHECK_INTERVAL))
+        return;
+
+    _allowGLReadPreemption();
+}
 
 
-
-#define MAKE_REGION(name, start, end)                                                                                  \
-    class name {                                                                                                       \
-    public:                                                                                                            \
-        name() { start(); }                                                                                            \
-        ~name() { end(); }                                                                                             \
-    };
-
-MAKE_REGION(GLReadRegion, acquireGLRead, releaseGLRead);
-MAKE_REGION(GLPromoteRegion, promoteGL, demoteGL);
-// MAKE_REGION(GLReadReleaseRegion, releaseGLRead, acquireGLRead);
-// MAKE_REGION(GLWriteReleaseRegion, releaseGLWrite, acquireGLWrite);
-#undef MAKE_REGION
+extern "C" void beginAllowThreads() noexcept;
+extern "C" void endAllowThreads() noexcept;
 
 class GLAllowThreadsReadRegion {
 public:
-    GLAllowThreadsReadRegion();
-    ~GLAllowThreadsReadRegion();
+    GLAllowThreadsReadRegion() { beginAllowThreads(); }
+    ~GLAllowThreadsReadRegion() { endAllowThreads(); }
 };
 
 
-#if THREADING_USE_GIL
-inline void acquireGLRead() {
-    acquireGLWrite();
-}
-inline void releaseGLRead() {
-    releaseGLWrite();
-}
-inline void promoteGL() {
-}
-inline void demoteGL() {
-}
-#endif
-
-#if !THREADING_USE_GIL && !THREADING_USE_GRWL
-inline void acquireGLRead() {
-}
-inline void releaseGLRead() {
-}
-inline void acquireGLWrite() {
-}
-inline void releaseGLWrite() {
-}
-inline void promoteGL() {
-}
-inline void demoteGL() {
-}
-inline void allowGLReadPreemption() {
-}
-#endif
-
+extern bool forgot_refs_via_fork;
 
 } // namespace threading
 } // namespace pyston

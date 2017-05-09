@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "future.h"
+#include "codegen/irgen/future.h"
+
+#include <map>
+
+#include "Python.h"
+
+#include "core/ast.h"
 
 namespace pyston {
 
@@ -23,53 +29,28 @@ struct FutureOption {
 };
 
 const std::map<std::string, FutureOption> future_options
-    = { { "absolute_import", { version_hex(2, 5, 0), version_hex(3, 0, 0), FF_ABSOLUTE_IMPORT } },
-        { "division", { version_hex(2, 2, 0), version_hex(3, 0, 0), FF_DIVISION } },
-        { "generators", { version_hex(2, 2, 0), version_hex(3, 0, 0), FF_GENERATOR } },
-        { "unicode_literals", { version_hex(2, 6, 0), version_hex(3, 0, 0), FF_UNICODE_LITERALS } },
-        { "print_function", { version_hex(2, 6, 0), version_hex(3, 0, 0), FF_PRINT_FUNCTION } },
-        { "nested_scopes", { version_hex(2, 1, 0), version_hex(2, 2, 0), FF_NESTED_SCOPES } },
-        { "with_statement", { version_hex(2, 5, 0), version_hex(3, 6, 0), FF_WITH_STATEMENT } } };
+    = { { "absolute_import", { version_hex(2, 5, 0), version_hex(3, 0, 0), CO_FUTURE_ABSOLUTE_IMPORT } },
+        { "division", { version_hex(2, 2, 0), version_hex(3, 0, 0), CO_FUTURE_DIVISION } },
+        { "unicode_literals", { version_hex(2, 6, 0), version_hex(3, 0, 0), CO_FUTURE_UNICODE_LITERALS } },
+        { "print_function", { version_hex(2, 6, 0), version_hex(3, 0, 0), CO_FUTURE_PRINT_FUNCTION } },
+        { "with_statement", { version_hex(2, 5, 0), version_hex(3, 6, 0), CO_FUTURE_WITH_STATEMENT } },
 
-// Helper function:
-void raiseSyntaxError(const char* file, AST* node_at, const char* msg, ...) {
-    va_list ap;
-    va_start(ap, msg);
-
-    char buf[1024];
-    vsnprintf(buf, sizeof(buf), msg, ap);
-
-
-    // TODO I'm not sure that it's safe to raise an exception here, since I think
-    // there will be things that end up not getting cleaned up.
-    // Then again, there are a huge number of things that don't get cleaned up even
-    // if an exception doesn't get thrown...
-
-    // TODO output is still a little wrong, should be, for example
-    //
-    //  File "../test/tests/future_non_existent.py", line 1
-    //    from __future__ import rvalue_references # should cause syntax error
-    //
-    // but instead it is
-    //
-    // Traceback (most recent call last):
-    //  File "../test/tests/future_non_existent.py", line -1, in :
-    //    from __future__ import rvalue_references # should cause syntax error
-    ::pyston::raiseSyntaxError(buf, node_at->lineno, node_at->col_offset, file, "");
-}
+        // These are mandatory in all versions we care about (>= 2.3)
+        { "generators", { version_hex(2, 2, 0), version_hex(3, 0, 0), CO_GENERATOR } },
+        { "nested_scopes", { version_hex(2, 1, 0), version_hex(2, 2, 0), CO_NESTED } } };
 
 void raiseFutureImportErrorNotFound(const char* file, AST* node, const char* name) {
-    raiseSyntaxError(file, node, "future feature %s is not defined", name);
+    raiseSyntaxErrorHelper(file, "", node, "future feature %s is not defined", name);
 }
 
 void raiseFutureImportErrorNotBeginning(const char* file, AST* node) {
-    raiseSyntaxError(file, node, "from __future__ imports must occur at the beginning of the file");
+    raiseSyntaxErrorHelper(file, "", node, "from __future__ imports must occur at the beginning of the file");
 }
 
 class BadFutureImportVisitor : public NoopASTVisitor {
 public:
     virtual bool visit_importfrom(AST_ImportFrom* node) {
-        if (node->module == "__future__") {
+        if (node->module.s() == "__future__") {
             raiseFutureImportErrorNotBeginning(file, node);
         }
         return true;
@@ -86,12 +67,12 @@ inline bool is_stmt_string(AST_stmt* stmt) {
     return stmt->type == AST_TYPE::Expr && static_cast<AST_Expr*>(stmt)->value->type == AST_TYPE::Str;
 }
 
-FutureFlags getFutureFlags(AST_Module* m, const char* file) {
+FutureFlags getFutureFlags(llvm::ArrayRef<AST_stmt*> body, const char* file) {
     FutureFlags ff = 0;
 
     // Set the defaults for the future flags depending on what version we are
     for (const std::pair<std::string, FutureOption>& p : future_options) {
-        if (PYTHON_VERSION_HEX >= p.second.mandatory_version_hex) {
+        if (PY_VERSION_HEX >= p.second.mandatory_version_hex) {
             ff |= p.second.ff_mask;
         }
     }
@@ -100,18 +81,18 @@ FutureFlags getFutureFlags(AST_Module* m, const char* file) {
     // occur at the beginning of the file.
     bool future_import_allowed = true;
     BadFutureImportVisitor import_visitor(file);
-    for (int i = 0; i < m->body.size(); i++) {
-        AST_stmt* stmt = m->body[i];
+    for (int i = 0; i < body.size(); i++) {
+        AST_stmt* stmt = body[i];
 
-        if (stmt->type == AST_TYPE::ImportFrom && static_cast<AST_ImportFrom*>(stmt)->module == "__future__") {
+        if (stmt->type == AST_TYPE::ImportFrom && static_cast<AST_ImportFrom*>(stmt)->module.s() == "__future__") {
             if (future_import_allowed) {
                 // We have a `from __future__` import statement, and we are
                 // still at the top of the file, so just set the appropriate
                 // future flag for each imported option.
 
                 for (AST_alias* alias : static_cast<AST_ImportFrom*>(stmt)->names) {
-                    const std::string& option_name = alias->name;
-                    auto iter = future_options.find(option_name);
+                    auto option_name = alias->name;
+                    auto iter = future_options.find(option_name.s());
                     if (iter == future_options.end()) {
                         // If it's not one of the available options, throw an error.
                         // Note: the __future__ module also exposes "all_feature_names",
@@ -120,7 +101,7 @@ FutureFlags getFutureFlags(AST_Module* m, const char* file) {
                         raiseFutureImportErrorNotFound(file, alias, option_name.c_str());
                     } else {
                         const FutureOption& fo = iter->second;
-                        if (PYTHON_VERSION_HEX >= fo.optional_version_hex) {
+                        if (PY_VERSION_HEX >= fo.optional_version_hex) {
                             ff |= fo.ff_mask;
                         } else {
                             raiseFutureImportErrorNotFound(file, alias, option_name.c_str());

@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,16 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/stringpool.h"
 #include "core/types.h"
 
 namespace pyston {
 
-class ScopeInfo;
 class CFGBlock;
+class CodeConstants;
 class BoxedClass;
-class AST_expr;
+class BST_stmt_with_dest;
+class OSREntryDescriptor;
 
 class TypeAnalysis {
 public:
@@ -36,15 +38,16 @@ public:
 
     virtual ~TypeAnalysis() {}
 
-    virtual ConcreteCompilerType* getTypeAtBlockStart(const std::string& name, CFGBlock* block) = 0;
-    virtual ConcreteCompilerType* getTypeAtBlockEnd(const std::string& name, CFGBlock* block) = 0;
-    virtual BoxedClass* speculatedExprClass(AST_expr*) = 0;
+    virtual ConcreteCompilerType* getTypeAtBlockStart(int vreg, CFGBlock* block) = 0;
+    virtual ConcreteCompilerType* getTypeAtBlockEnd(int vreg, CFGBlock* block) = 0;
+    virtual BoxedClass* speculatedExprClass(BST_stmt_with_dest*) = 0;
 };
 
-// TypeAnalysis* analyze(CFG *cfg, std::unordered_map<std::string, ConcreteCompilerType*> arg_types);
-TypeAnalysis* doTypeAnalysis(CFG* cfg, const SourceInfo::ArgNames& arg_names,
-                             const std::vector<ConcreteCompilerType*>& arg_types, EffortLevel::EffortLevel effort,
-                             TypeAnalysis::SpeculationLevel speculation, ScopeInfo* scope_info);
+TypeAnalysis* doTypeAnalysis(CFG* cfg, const ParamNames& param_names,
+                             const std::vector<ConcreteCompilerType*>& arg_types, EffortLevel effort,
+                             TypeAnalysis::SpeculationLevel speculation, const CodeConstants& code_constants);
+TypeAnalysis* doTypeAnalysis(const OSREntryDescriptor* entry_descriptor, EffortLevel effort,
+                             TypeAnalysis::SpeculationLevel speculation, const CodeConstants& code_constants);
 }
 
 #endif

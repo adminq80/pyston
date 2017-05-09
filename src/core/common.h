@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdint.h>
 #include <string>
 #include <unordered_map>
@@ -39,16 +40,7 @@
 #define _CAT(A, B) A##B
 #define CAT(A, B) _CAT(A, B)
 
-// GCC and clang handle always_inline very differently;
-// we mostly only care about it for the stdlib, so just remove the attributes
-// if we're not in clang
-#ifdef __clang__
-#define ALWAYSINLINE __attribute__((always_inline))
-#define NOINLINE __attribute__((noinline))
-#else
-#define ALWAYSINLINE
-#define NOINLINE
-#endif
+#define ARRAY_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 #if LLVMREV < 210783
 #define llvm_error_code llvm::error_code
@@ -76,13 +68,25 @@
 
 #define UNIMPLEMENTED() RELEASE_ASSERT(0, "unimplemented")
 
-#define OFFSET(cls, attr) ((char*)&(((cls*)0x01)->attr) - (char*)0x1)
-
 // Allow using std::pair as keys in hashtables:
 namespace std {
-template <typename T1, typename T2> struct hash<pair<T1, T2> > {
+template <typename T1, typename T2> struct hash<pair<T1, T2>> {
     size_t operator()(const pair<T1, T2> p) const { return hash<T1>()(p.first) ^ (hash<T2>()(p.second) << 1); }
 };
+}
+
+namespace std {
+template <typename T1, typename T2, typename T3> struct hash<tuple<T1, T2, T3>> {
+    size_t operator()(const tuple<T1, T2, T3> p) const {
+        return hash<T1>()(std::get<0>(p)) ^ (hash<T2>()(std::get<1>(p)) << 1) ^ (hash<T3>()(std::get<2>(p)) << 2);
+    }
+};
+}
+
+namespace pyston {
+template <typename T> constexpr bool fitsInto(int64_t x) {
+    return std::numeric_limits<T>::min() <= x && x <= std::numeric_limits<T>::max();
+}
 }
 
 #endif

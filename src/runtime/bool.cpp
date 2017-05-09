@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,38 +14,39 @@
 
 #include "core/common.h"
 #include "core/types.h"
-#include "gc/collector.h"
+#include "runtime/int.h"
 #include "runtime/objmodel.h"
 #include "runtime/types.h"
 
 namespace pyston {
 
-Box* True, *False;
+Box* pyston_True, *pyston_False;
 
-extern "C" PyObject* PyBool_FromLong(long n) {
+extern "C" PyObject* PyBool_FromLong(long n) noexcept {
     return boxBool(n != 0);
 }
 
-extern "C" Box* boolInvert(BoxedBool* v) {
-    return boxInt(~v->b);
-}
-
-extern "C" Box* boolPos(BoxedBool* v) {
-    return boxInt(v->b ? 1 : 0);
-}
-
-extern "C" Box* boolNeg(BoxedBool* v) {
-    return boxInt(v->b ? -1 : 0);
-}
-
 extern "C" Box* boolNonzero(BoxedBool* v) {
-    return v;
+    return incref(v);
 }
 
-extern "C" Box* boolRepr(BoxedBool* v) {
-    if (v->b)
-        return boxStrConstant("True");
-    return boxStrConstant("False");
+template <ExceptionStyle S> Box* boolRepr(Box* v) noexcept(S == CAPI) {
+    static BoxedString* true_str = getStaticString("True");
+    static BoxedString* false_str = getStaticString("False");
+    if (!PyBool_Check(v))
+        return setDescrTypeError<S>(v, "bool", "__repr__");
+
+    if (v == Py_True)
+        return incref(true_str);
+    return incref(false_str);
+}
+
+size_t bool_hash(BoxedBool* v) {
+    return v == Py_True;
+}
+
+Box* boolHash(BoxedBool* v) {
+    return boxInt(bool_hash(v));
 }
 
 extern "C" Box* boolNew(Box* cls, Box* val) {
@@ -55,29 +56,61 @@ extern "C" Box* boolNew(Box* cls, Box* val) {
     return boxBool(b);
 }
 
-void setupBool() {
-    bool_cls->giveAttr("__name__", boxStrConstant("bool"));
+extern "C" Box* boolAnd(BoxedBool* lhs, BoxedBool* rhs) {
+    if (!PyBool_Check(lhs))
+        raiseExcHelper(TypeError, "descriptor '__and__' requires a 'bool' object but received a '%s'",
+                       getTypeName(lhs));
 
-    bool_cls->giveAttr("__invert__", new BoxedFunction(boxRTFunction((void*)boolInvert, BOXED_INT, 1)));
-    bool_cls->giveAttr("__pos__", new BoxedFunction(boxRTFunction((void*)boolPos, BOXED_INT, 1)));
-    bool_cls->giveAttr("__neg__", new BoxedFunction(boxRTFunction((void*)boolNeg, BOXED_INT, 1)));
-    bool_cls->giveAttr("__nonzero__", new BoxedFunction(boxRTFunction((void*)boolNonzero, BOXED_BOOL, 1)));
-    bool_cls->giveAttr("__repr__", new BoxedFunction(boxRTFunction((void*)boolRepr, STR, 1)));
-    bool_cls->giveAttr("__str__", bool_cls->getattr("__repr__"));
+    if (!PyBool_Check(rhs))
+        return intAnd(lhs, rhs);
 
-    bool_cls->giveAttr("__new__",
-                       new BoxedFunction(boxRTFunction((void*)boolNew, UNKNOWN, 2, 1, false, false), { None }));
-
-
-    bool_cls->freeze();
-
-    True = new BoxedBool(true);
-    False = new BoxedBool(false);
-
-    gc::registerPermanentRoot(True);
-    gc::registerPermanentRoot(False);
+    return boxBool(lhs->n && rhs->n);
 }
 
-void teardownBool() {
+extern "C" Box* boolOr(BoxedBool* lhs, BoxedBool* rhs) {
+    if (!PyBool_Check(lhs))
+        raiseExcHelper(TypeError, "descriptor '__or__' requires a 'bool' object but received a '%s'", getTypeName(lhs));
+
+    if (!PyBool_Check(rhs))
+        return intOr(lhs, rhs);
+
+    return boxBool(lhs->n || rhs->n);
+}
+
+extern "C" Box* boolXor(BoxedBool* lhs, BoxedBool* rhs) {
+    if (!PyBool_Check(lhs))
+        raiseExcHelper(TypeError, "descriptor '__xor__' requires a 'bool' object but received a '%s'",
+                       getTypeName(lhs));
+
+    if (!PyBool_Check(rhs))
+        return intXor(lhs, rhs);
+
+    return boxBool(lhs->n ^ rhs->n);
+}
+
+
+void setupBool() {
+    static PyNumberMethods bool_as_number;
+    bool_cls->tp_as_number = &bool_as_number;
+
+    bool_cls->giveAttr("__nonzero__",
+                       new BoxedFunction(BoxedCode::create((void*)boolNonzero, BOXED_BOOL, 1, "bool.__nonzero__")));
+    bool_cls->giveAttr("__repr__", new BoxedFunction(BoxedCode::create((void*)boolRepr<CXX>, STR, 1, "bool.__repr__")));
+    bool_cls->giveAttr("__hash__",
+                       new BoxedFunction(BoxedCode::create((void*)boolHash, BOXED_INT, 1, "bool.__hash__")));
+
+    bool_cls->giveAttr(
+        "__new__",
+        new BoxedFunction(BoxedCode::create((void*)boolNew, UNKNOWN, 2, false, false, "bool.__new__"), { Py_None }));
+
+    // TODO: type specialize
+    bool_cls->giveAttr("__and__", new BoxedFunction(BoxedCode::create((void*)boolAnd, UNKNOWN, 2, "bool.__and__")));
+    bool_cls->giveAttr("__or__", new BoxedFunction(BoxedCode::create((void*)boolOr, UNKNOWN, 2, "bool.__or__")));
+    bool_cls->giveAttr("__xor__", new BoxedFunction(BoxedCode::create((void*)boolXor, UNKNOWN, 2, "bool.__xor__")));
+
+    bool_cls->freeze();
+    bool_cls->tp_hash = (hashfunc)bool_hash;
+    bool_cls->tp_repr = boolRepr<CAPI>;
+    bool_as_number.nb_int = int_cls->tp_as_number->nb_int;
 }
 }

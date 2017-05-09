@@ -53,8 +53,6 @@ else:
     print 'False'
 
 # __getattr__ and __setattr__
-# Looks like __getattr__ and __setattr__ should *not* be looked up with
-# the descriptor protocol
 class DescriptorGetattr(object):
     def __get__(self, obj, type):
         print 'getattr __get__ called'
@@ -68,8 +66,8 @@ class DescriptorSetattr(object):
         def setattr(attr, val):
             print 'setattr called for attr', attr, val
 class D(object):
-    __getattr__ = DescriptorGetattr
-    __setattr__ = DescriptorSetattr
+    __getattr__ = DescriptorGetattr()
+    __setattr__ = DescriptorSetattr()
 
 d = D()
 try:
@@ -119,3 +117,7 @@ print type(f.at) # should not call __get__
 f.at = 12 # should not call __set__, should print nothing
 #TODO uncomment this:
 #print f.__dict__['at']
+
+
+# test if we support getset.__get__ with default args
+print type(5).__dict__["real"].__get__(42)

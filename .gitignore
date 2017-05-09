@@ -1,3 +1,5 @@
+build
+
 Makefile.local
 tools/astprint
 tools/demangle
@@ -20,10 +22,14 @@ pyston_release
 pyston_grwl
 pyston_grwl_dbg
 pyston_nosync
+pyston_gcc
+pyston_release_gcc
+pyston_release_gcc_pgo
+pyston_release_gcc_pgo_instrumented
+pystontmp*/
+/*_unittest
 
 *.cache
-tests/t.py
-tests/t2.py
 *.bc
 stdlib.ll
 *.o
@@ -34,6 +40,7 @@ stdlib*.ll
 oprofile_data
 pprof.jit
 tags
+TAGS
 *.pyc
 
 perf.data
@@ -44,6 +51,8 @@ gmon.out
 find_problem.status
 *.expected_cache
 
+plugins/clang_capi
+
 *.so
 *.pch
 
@@ -53,3 +62,5 @@ compile.log
 *.swo
 
 *.out
+
+*~

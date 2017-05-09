@@ -1,7 +1,7 @@
-# import_target defines __all__ to be ['x']
+# import_target defines __all__ to be ['x', u'z']
 from import_target import *
 
-print x
+print x, z
 try:
     print foo
     assert 0
@@ -27,8 +27,8 @@ except NameError:
 try:
     from import_target_bad_all import *
     assert 0
-except AttributeError:
-    pass
+except AttributeError, e:
+    print e
 
 from import_target_custom_all import *
 print z

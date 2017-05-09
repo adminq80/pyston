@@ -29,13 +29,33 @@ def f3():
     s = "hello world"
     t = (1.0, "asdf")
     print sorted(locals().items())
+    print sorted(vars().items())
 f3()
 
-def f4():
+def f4(t):
     """testing synthetic 'is_defined' variables"""
-    if 0:
+    if t:
         x = 1
     else:
         y = 2
     print sorted(locals().items())
-# f4()
+    print sorted(vars().items())
+f4(0)
+f4(1)
+
+def f5():
+    a = 0
+    b = 1
+    def g():
+        print a
+        def h():
+            a = 2
+            def i():
+                print a
+                print b
+                print sorted(locals().items())
+                print sorted(vars().items())
+            i()
+        h()
+    g()
+f5()

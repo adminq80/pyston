@@ -1,5 +1,3 @@
-# allow-warning: converting unicode literal to str
-
 try:
     import non_existent_module
     assert 0, "shouldn't get here"
@@ -18,7 +16,7 @@ try:
 except ImportError, e:
     print e
 
-# Run it all again inside a funtion scope:
+# Run it all again inside a function scope:
 def f():
     try:
         import non_existent_module
@@ -64,3 +62,15 @@ def f2():
     except NameError, e:
         print e
 f2()
+
+try:
+    import import_failure_target
+    raise Exception("This should not be importable")
+except Exception, e:
+    print type(e), e
+
+try:
+    import import_failure_target
+    raise Exception("This should not be importable if we tried it again")
+except Exception, e:
+    print type(e), e

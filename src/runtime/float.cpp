@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,28 +12,163 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cfloat>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
+#include <gmp.h>
 
+#include "capi/typeobject.h"
+#include "capi/types.h"
 #include "core/types.h"
 #include "runtime/inline/boxing.h"
+#include "runtime/long.h"
 #include "runtime/objmodel.h"
 #include "runtime/types.h"
 #include "runtime/util.h"
 
+extern "C" int float_coerce(PyObject** v, PyObject** w) noexcept;
+extern "C" int float_pow_unboxed(double iv, double iw, double* res) noexcept;
+extern "C" PyObject* float_as_integer_ratio(PyObject* v, PyObject* unused) noexcept;
+extern "C" PyObject* float_divmod(PyObject* v, PyObject* w) noexcept;
+extern "C" PyObject* float__format__(PyObject* v) noexcept;
+extern "C" PyObject* float_fromhex(PyObject* cls, PyObject* arg) noexcept;
+extern "C" PyObject* float_getformat(PyTypeObject* v, PyObject* arg) noexcept;
+extern "C" PyObject* float_getnewargs(PyFloatObject* v) noexcept;
+extern "C" PyObject* float_hex(PyObject* v) noexcept;
+extern "C" PyObject* float_is_integer(PyObject* v) noexcept;
+extern "C" PyObject* float_pow(PyObject* v, PyObject* w, PyObject* z) noexcept;
+extern "C" PyObject* float_richcompare(PyObject* v, PyObject* w, int op) noexcept;
+extern "C" PyObject* float_setformat(PyTypeObject* v, PyObject* args) noexcept;
+extern "C" PyObject* float_str(PyObject* v) noexcept;
+
 namespace pyston {
 
-extern "C" PyObject* PyFloat_FromDouble(double d) {
+/* Special free list -- see comments for same code in intobject.c. */
+#define BLOCK_SIZE 1000 /* 1K less typical malloc overhead */
+#define BHEAD_SIZE 8    /* Enough for a 64-bit pointer */
+#define N_FLOATOBJECTS ((BLOCK_SIZE - BHEAD_SIZE) / sizeof(PyFloatObject))
+
+struct _floatblock {
+    struct _floatblock* next;
+    PyFloatObject objects[N_FLOATOBJECTS];
+};
+
+typedef struct _floatblock PyFloatBlock;
+
+static PyFloatBlock* block_list = NULL;
+PyFloatObject* BoxedFloat::free_list = NULL;
+
+PyFloatObject* BoxedFloat::fill_free_list(void) noexcept {
+    PyFloatObject* p, *q;
+    /* XXX Float blocks escape the object heap. Use PyObject_MALLOC ??? */
+    p = (PyFloatObject*)PyMem_MALLOC(sizeof(PyFloatBlock));
+    if (p == NULL)
+        return (PyFloatObject*)PyErr_NoMemory();
+    ((PyFloatBlock*)p)->next = block_list;
+    block_list = (PyFloatBlock*)p;
+    p = &((PyFloatBlock*)p)->objects[0];
+    q = p + N_FLOATOBJECTS;
+    while (--q > p)
+        q->ob_type = (struct _typeobject*)(q - 1);
+    q->ob_type = NULL;
+    return p + N_FLOATOBJECTS - 1;
+}
+
+void BoxedFloat::tp_dealloc(Box* b) noexcept {
+#ifdef DISABLE_INT_FREELIST
+    b->cls->tp_free(b);
+#else
+    if (likely(PyFloat_CheckExact(b))) {
+        PyFloatObject* v = (PyFloatObject*)(b);
+        v->ob_type = (struct _typeobject*)free_list;
+        free_list = v;
+    } else {
+        b->cls->tp_free(b);
+    }
+#endif
+}
+
+extern "C" int PyFloat_ClearFreeList() noexcept {
+    PyFloatObject* p;
+    PyFloatBlock* list, *next;
+    int i;
+    int u; /* remaining unfreed ints per block */
+    int freelist_size = 0;
+
+    list = block_list;
+    block_list = NULL;
+    BoxedFloat::free_list = NULL;
+    while (list != NULL) {
+        u = 0;
+        for (i = 0, p = &list->objects[0]; i < N_FLOATOBJECTS; i++, p++) {
+            if (PyFloat_CheckExact((BoxedFloat*)p) && Py_REFCNT(p) != 0)
+                u++;
+        }
+        next = list->next;
+        if (u) {
+            list->next = block_list;
+            block_list = list;
+            for (i = 0, p = &list->objects[0]; i < N_FLOATOBJECTS; i++, p++) {
+                if (!PyFloat_CheckExact((BoxedFloat*)p) || Py_REFCNT(p) == 0) {
+                    p->ob_type = (struct _typeobject*)BoxedFloat::free_list;
+                    BoxedFloat::free_list = p;
+                }
+            }
+        } else {
+            PyMem_FREE(list);
+        }
+        freelist_size += u;
+        list = next;
+    }
+    return freelist_size;
+}
+
+extern "C" PyObject* PyFloat_FromDouble(double d) noexcept {
     return boxFloat(d);
 }
 
-extern "C" double PyFloat_AsDouble(PyObject* o) {
-    if (o->cls == float_cls)
+extern "C" double PyFloat_AsDouble(PyObject* o) noexcept {
+    assert(o);
+
+    if (PyFloat_CheckExact(o))
         return static_cast<BoxedFloat*>(o)->d;
-    else if (o->cls == int_cls)
-        return static_cast<BoxedInt*>(o)->n;
-    Py_FatalError("unimplemented");
-    return 0.0;
+
+    // special case: int (avoids all the boxing below, and int_cls->tp_as_number
+    // isn't implemented at the time of this writing)
+    // This is an exact check.
+    if (o->cls == int_cls || o->cls == bool_cls)
+        return (double)static_cast<BoxedInt*>(o)->n;
+    // special case: long
+    if (o->cls == long_cls) {
+        double result = PyLong_AsDouble(static_cast<BoxedLong*>(o));
+        if (result == -1.0 && PyErr_Occurred())
+            return -1.0;
+
+        return result;
+    }
+
+    // implementation from cpython:
+    PyNumberMethods* nb;
+    BoxedFloat* fo;
+    double val;
+
+    if ((nb = Py_TYPE(o)->tp_as_number) == NULL || nb->nb_float == NULL) {
+        PyErr_SetString(PyExc_TypeError, "a float is required");
+        return -1;
+    };
+    fo = (BoxedFloat*)(*nb->nb_float)(o);
+    if (fo == NULL)
+        return -1;
+    AUTO_DECREF(fo);
+    if (!PyFloat_Check(fo)) {
+        PyErr_SetString(PyExc_TypeError, "nb_float should return float object");
+        return -1;
+    }
+
+    val = static_cast<BoxedFloat*>(fo)->d;
+
+    return val;
 }
 
 template <typename T> static inline void raiseDivZeroExcIfZero(T var) {
@@ -55,10 +190,6 @@ extern "C" double mod_float_float(double lhs, double rhs) {
     return r;
 }
 
-extern "C" double pow_float_float(double lhs, double rhs) {
-    return pow(lhs, rhs);
-}
-
 extern "C" double div_float_float(double lhs, double rhs) {
     raiseDivZeroExcIfZero(rhs);
     return lhs / rhs;
@@ -70,397 +201,498 @@ extern "C" double floordiv_float_float(double lhs, double rhs) {
 }
 
 extern "C" Box* floatAddFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
     return boxFloat(lhs->d + rhs->d);
 }
 
 extern "C" Box* floatAddInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
     return boxFloat(lhs->d + rhs->n);
 }
 
 extern "C" Box* floatAdd(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatAddInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatAddFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return boxFloat(lhs->d + rhs_f);
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
     }
 }
 
 extern "C" Box* floatDivFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
     raiseDivZeroExcIfZero(rhs->d);
     return boxFloat(lhs->d / rhs->d);
 }
 
 extern "C" Box* floatDivInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
     raiseDivZeroExcIfZero(rhs->n);
     return boxFloat(lhs->d / rhs->n);
 }
 
 extern "C" Box* floatDiv(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatDivInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatDivFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return boxFloat(lhs->d / rhs_f);
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
     }
 }
 
 extern "C" Box* floatTruediv(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatDivInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatDivFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return boxFloat(lhs->d / rhs_f);
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
     }
 }
 
 extern "C" Box* floatRDivFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
     raiseDivZeroExcIfZero(lhs->d);
     return boxFloat(rhs->d / lhs->d);
 }
 
 extern "C" Box* floatRDivInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
     raiseDivZeroExcIfZero(lhs->d);
     return boxFloat(rhs->n / lhs->d);
 }
 
 extern "C" Box* floatRDiv(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatRDivInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatRDivFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        raiseDivZeroExcIfZero(lhs->d);
+        return boxFloat(rhs_f / lhs->d);
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
+    }
+}
+
+Box* floatRTruediv(BoxedFloat* lhs, Box* rhs) {
+    if (!PyFloat_Check(lhs))
+        raiseExcHelper(TypeError, "descriptor '__rtruediv__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
+
+    if (PyInt_Check(rhs)) {
+        return floatRDivInt(lhs, static_cast<BoxedInt*>(rhs));
+    } else if (PyFloat_Check(rhs)) {
+        return floatRDivFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        raiseDivZeroExcIfZero(lhs->d);
+        return boxFloat(rhs_f / lhs->d);
+    } else {
+        return incref(NotImplemented);
     }
 }
 
 extern "C" Box* floatFloorDivFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
     raiseDivZeroExcIfZero(rhs->d);
     return boxFloat(floor(lhs->d / rhs->d));
 }
 
 extern "C" Box* floatFloorDivInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
     raiseDivZeroExcIfZero(rhs->n);
     return boxFloat(floor(lhs->d / rhs->n));
 }
 
 extern "C" Box* floatFloorDiv(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatFloorDivInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatFloorDivFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return floatFloorDivFloat(lhs, new BoxedFloat(rhs_f));
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
     }
 }
 
-extern "C" Box* floatEqFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
-    return boxBool(lhs->d == rhs->d);
-}
-
-extern "C" Box* floatEqInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
-    return boxBool(lhs->d == rhs->n);
+extern "C" Box* floatRFloorDiv(BoxedFloat* lhs, Box* _rhs) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(_rhs)) {
+        BoxedInt* rhs = (BoxedInt*)_rhs;
+        raiseDivZeroExcIfZero(lhs->d);
+        return boxFloat(floor(rhs->n / lhs->d));
+    } else if (PyFloat_Check(_rhs)) {
+        BoxedFloat* rhs = (BoxedFloat*)_rhs;
+        raiseDivZeroExcIfZero(lhs->d);
+        return boxFloat(floor(rhs->d / lhs->d));
+    } else if (PyLong_Check(_rhs)) {
+        double rhs_f = PyLong_AsDouble(_rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return floatFloorDivFloat(new BoxedFloat(rhs_f), lhs);
+    } else {
+        return incref(NotImplemented);
+    }
 }
 
 extern "C" Box* floatEq(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
-        return floatEqInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
-        return floatEqFloat(lhs, static_cast<BoxedFloat*>(rhs));
-    } else {
-        return NotImplemented;
+    if (!PyFloat_Check(lhs)) {
+        raiseExcHelper(TypeError, "descriptor '__eq__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
     }
-}
+    Box* res = float_richcompare(lhs, rhs, Py_EQ);
+    if (!res) {
+        throwCAPIException();
+    }
 
-extern "C" Box* floatNeFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
-    return boxBool(lhs->d != rhs->d);
-}
-
-extern "C" Box* floatNeInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
-    return boxBool(lhs->d != rhs->n);
+    return res;
 }
 
 extern "C" Box* floatNe(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
-        return floatNeInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
-        return floatNeFloat(lhs, static_cast<BoxedFloat*>(rhs));
-    } else {
-        return NotImplemented;
+    if (!PyFloat_Check(lhs)) {
+        raiseExcHelper(TypeError, "descriptor '__ne__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
     }
-}
-
-extern "C" Box* floatLtFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
-    return boxBool(lhs->d < rhs->d);
-}
-
-extern "C" Box* floatLtInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
-    return boxBool(lhs->d < rhs->n);
-}
-
-extern "C" Box* floatLt(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
-        return floatLtInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
-        return floatLtFloat(lhs, static_cast<BoxedFloat*>(rhs));
-    } else {
-        return NotImplemented;
+    Box* res = float_richcompare(lhs, rhs, Py_NE);
+    if (!res) {
+        throwCAPIException();
     }
-}
 
-extern "C" Box* floatLeFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
-    return boxBool(lhs->d <= rhs->d);
-}
-
-extern "C" Box* floatLeInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
-    return boxBool(lhs->d <= rhs->n);
+    return res;
 }
 
 extern "C" Box* floatLe(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
-        return floatLeInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
-        return floatLeFloat(lhs, static_cast<BoxedFloat*>(rhs));
-    } else {
-        return NotImplemented;
+    if (!PyFloat_Check(lhs)) {
+        raiseExcHelper(TypeError, "descriptor '__le__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
     }
-}
-
-extern "C" Box* floatGtFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
-    return boxBool(lhs->d > rhs->d);
-}
-
-extern "C" Box* floatGtInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
-    return boxBool(lhs->d > rhs->n);
-}
-
-extern "C" Box* floatGt(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
-        return floatGtInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
-        return floatGtFloat(lhs, static_cast<BoxedFloat*>(rhs));
-    } else {
-        return NotImplemented;
+    Box* res = float_richcompare(lhs, rhs, Py_LE);
+    if (!res) {
+        throwCAPIException();
     }
+
+    return res;
 }
 
-extern "C" Box* floatGeFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
-    return boxBool(lhs->d >= rhs->d);
-}
+extern "C" Box* floatLt(BoxedFloat* lhs, Box* rhs) {
+    if (!PyFloat_Check(lhs)) {
+        raiseExcHelper(TypeError, "descriptor '__lt__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
+    }
+    Box* res = float_richcompare(lhs, rhs, Py_LT);
+    if (!res) {
+        throwCAPIException();
+    }
 
-extern "C" Box* floatGeInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
-    return boxBool(lhs->d >= rhs->n);
+    return res;
 }
 
 extern "C" Box* floatGe(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
-        return floatGeInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
-        return floatGeFloat(lhs, static_cast<BoxedFloat*>(rhs));
-    } else {
-        return NotImplemented;
+    if (!PyFloat_Check(lhs)) {
+        raiseExcHelper(TypeError, "descriptor '__ge__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
     }
+    Box* res = float_richcompare(lhs, rhs, Py_GE);
+    if (!res) {
+        throwCAPIException();
+    }
+
+    return res;
+}
+
+extern "C" Box* floatGt(BoxedFloat* lhs, Box* rhs) {
+    if (!PyFloat_Check(lhs)) {
+        raiseExcHelper(TypeError, "descriptor '__gt__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
+    }
+    Box* res = float_richcompare(lhs, rhs, Py_GT);
+    if (!res) {
+        throwCAPIException();
+    }
+
+    return res;
 }
 
 extern "C" Box* floatModFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
     return boxFloat(mod_float_float(lhs->d, rhs->d));
 }
 
 extern "C" Box* floatModInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
     return boxFloat(mod_float_float(lhs->d, rhs->n));
 }
 
 extern "C" Box* floatMod(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatModInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatModFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return boxFloat(mod_float_float(lhs->d, rhs_f));
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
     }
 }
 
 extern "C" Box* floatRModFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
     return boxFloat(mod_float_float(rhs->d, lhs->d));
 }
 
 extern "C" Box* floatRModInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
     return boxFloat(mod_float_float(rhs->n, lhs->d));
 }
 
 extern "C" Box* floatRMod(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatRModInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatRModFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return boxFloat(mod_float_float(rhs_f, lhs->d));
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
     }
 }
 
-extern "C" Box* floatPowFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
-    return boxFloat(pow(lhs->d, rhs->d));
+Box* floatDivmod(BoxedFloat* lhs, Box* rhs) {
+    if (!PyFloat_Check(lhs))
+        raiseExcHelper(TypeError, "descriptor '__divmod__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
+
+    Box* res = float_divmod(lhs, rhs);
+    if (!res) {
+        throwCAPIException();
+    }
+    return res;
 }
 
-extern "C" Box* floatPowInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
-    return boxFloat(pow(lhs->d, rhs->n));
+Box* floatRDivmod(BoxedFloat* lhs, Box* rhs) {
+    if (!PyFloat_Check(lhs))
+        raiseExcHelper(TypeError, "descriptor '__rdivmod__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
+
+    Box* res = float_divmod(rhs, lhs);
+    if (!res) {
+        throwCAPIException();
+    }
+    return res;
 }
 
-extern "C" Box* floatPow(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
-        return floatPowInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
-        return floatPowFloat(lhs, static_cast<BoxedFloat*>(rhs));
+extern "C" Box* floatPow(BoxedFloat* lhs, Box* rhs, Box* mod) {
+    Box* res = float_pow(lhs, rhs, mod);
+    if (!res) {
+        throwCAPIException();
+    }
+    return res;
+}
+
+extern "C" Box* floatPowFloat(BoxedFloat* lhs, BoxedFloat* rhs, Box* mod = Py_None) {
+    // TODO to specialize this, need to account for all the special cases in float_pow
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
+    return floatPow(lhs, rhs, mod);
+}
+
+extern "C" Box* floatPowInt(BoxedFloat* lhs, BoxedInt* rhs, Box* mod = Py_None) {
+    // TODO to specialize this, need to account for all the special cases in float_pow
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
+    return floatPow(lhs, rhs, mod);
+}
+
+Box* floatRPow(BoxedFloat* lhs, Box* rhs) {
+    if (!PyFloat_Check(lhs))
+        raiseExcHelper(TypeError, "descriptor '__rpow__' requires a 'float' object but received a '%s'",
+                       getTypeName(lhs));
+
+    Box* res = float_pow(rhs, lhs, Py_None);
+    if (!res) {
+        throwCAPIException();
+    }
+    return res;
+}
+
+extern "C" double pow_float_float(double lhs, double rhs) {
+    double res;
+    int err = float_pow_unboxed(lhs, rhs, &res);
+    if (err) {
+        throwCAPIException();
     } else {
-        return NotImplemented;
+        return res;
     }
 }
 
 extern "C" Box* floatMulFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
     return boxFloat(lhs->d * rhs->d);
 }
 
 extern "C" Box* floatMulInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
     return boxFloat(lhs->d * rhs->n);
 }
 
 extern "C" Box* floatMul(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatMulInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatMulFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return boxFloat(lhs->d * rhs_f);
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
     }
 }
 
 extern "C" Box* floatSubFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
     return boxFloat(lhs->d - rhs->d);
 }
 
 extern "C" Box* floatSubInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
     return boxFloat(lhs->d - rhs->n);
 }
 
 extern "C" Box* floatSub(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatSubInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatSubFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return boxFloat(lhs->d - rhs_f);
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
     }
 }
 
 extern "C" Box* floatRSubFloat(BoxedFloat* lhs, BoxedFloat* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == float_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyFloat_Check(rhs));
     return boxFloat(rhs->d - lhs->d);
 }
 
 extern "C" Box* floatRSubInt(BoxedFloat* lhs, BoxedInt* rhs) {
-    assert(lhs->cls == float_cls);
-    assert(rhs->cls == int_cls);
+    assert(PyFloat_Check(lhs));
+    assert(PyInt_Check(rhs));
     return boxFloat(rhs->n - lhs->d);
 }
 
 extern "C" Box* floatRSub(BoxedFloat* lhs, Box* rhs) {
-    assert(lhs->cls == float_cls);
-    if (rhs->cls == int_cls) {
+    assert(PyFloat_Check(lhs));
+    if (PyInt_Check(rhs)) {
         return floatRSubInt(lhs, static_cast<BoxedInt*>(rhs));
-    } else if (rhs->cls == float_cls) {
+    } else if (PyFloat_Check(rhs)) {
         return floatRSubFloat(lhs, static_cast<BoxedFloat*>(rhs));
+    } else if (PyLong_Check(rhs)) {
+        double rhs_f = PyLong_AsDouble(rhs);
+        if (rhs_f == -1.0 && PyErr_Occurred()) {
+            throwCAPIException();
+        }
+        return boxFloat(rhs_f - lhs->d);
     } else {
-        return NotImplemented;
+        return incref(NotImplemented);
     }
 }
 
 Box* floatNeg(BoxedFloat* self) {
-    assert(self->cls == float_cls);
+    assert(PyFloat_Check(self));
     return boxFloat(-self->d);
 }
 
+Box* floatPos(BoxedFloat* self) {
+    assert(PyFloat_Check(self));
+    return PyFloat_FromDouble(self->d);
+}
+
+Box* floatAbs(BoxedFloat* self) {
+    if (!PyFloat_Check(self))
+        raiseExcHelper(TypeError, "descriptor '__abs__' requires a 'float' object but received a '%s'",
+                       getTypeName(self));
+    double res = std::abs(self->d);
+    return boxFloat(res);
+}
+
 bool floatNonzeroUnboxed(BoxedFloat* self) {
-    assert(self->cls == float_cls);
+    assert(PyFloat_Check(self));
     return self->d != 0.0;
 }
 
@@ -468,179 +700,348 @@ Box* floatNonzero(BoxedFloat* self) {
     return boxBool(floatNonzeroUnboxed(self));
 }
 
-std::string floatFmt(double x, int precision, char code) {
-    char fmt[5] = "%.*g";
-    fmt[3] = code;
+template <ExceptionStyle S> static BoxedFloat* _floatNew(Box* x) noexcept(S == CAPI) {
+    Box* rtn;
+    if (PyString_CheckExact(x))
+        rtn = PyFloat_FromString(x, NULL);
+    else
+        rtn = PyNumber_Float(x);
+    if (!rtn && S == CXX)
+        throwCAPIException();
+    return static_cast<BoxedFloat*>(rtn);
+}
 
-    if (isnan(x)) {
-        return "nan";
-    }
-    if (isinf(x)) {
-        if (x > 0)
-            return "inf";
-        return "-inf";
-    }
-
-    char buf[40];
-    int n = snprintf(buf, 40, fmt, precision, x);
-
-    int dot = -1;
-    int exp = -1;
-    int first = -1;
-    for (int i = 0; i < n; i++) {
-        char c = buf[i];
-        if (c == '.') {
-            dot = i;
-        } else if (c == 'e') {
-            exp = i;
-        } else if (first == -1 && c >= '0' && c <= '9') {
-            first = i;
-        }
+template <ExceptionStyle S> Box* floatNew(BoxedClass* _cls, Box* a) noexcept(S == CAPI) {
+    if (!PyType_Check(_cls)) {
+        if (S == CAPI) {
+            PyErr_Format(TypeError, "float.__new__(X): X is not a type object (%s)", getTypeName(_cls));
+            return NULL;
+        } else
+            raiseExcHelper(TypeError, "float.__new__(X): X is not a type object (%s)", getTypeName(_cls));
     }
 
-    if (dot == -1 && exp == -1) {
-        if (n == precision) {
-            memmove(buf + first + 2, buf + first + 1, (n - first - 1));
-            buf[first + 1] = '.';
-            exp = n + 1;
-            int exp_digs = snprintf(buf + n + 1, 5, "e%+.02d", (n - first - 1));
-            n += exp_digs + 1;
-            dot = 1;
+    BoxedClass* cls = static_cast<BoxedClass*>(_cls);
+    if (!isSubclass(cls, float_cls)) {
+        if (S == CAPI) {
+            PyErr_Format(TypeError, "float.__new__(%s): %s is not a subtype of float", getNameOfClass(cls),
+                         getNameOfClass(cls));
+            return NULL;
         } else {
-            buf[n] = '.';
-            buf[n + 1] = '0';
-            n += 2;
-
-            return std::string(buf, n);
+            raiseExcHelper(TypeError, "float.__new__(%s): %s is not a subtype of float", getNameOfClass(cls),
+                           getNameOfClass(cls));
         }
     }
 
-    if (exp != -1 && dot == -1) {
-        return std::string(buf, n);
-    }
+    if (cls == float_cls)
+        return _floatNew<S>(a);
 
-    assert(dot != -1);
+    BoxedFloat* f = _floatNew<S>(a);
+    if (!f) {
+        assert(S == CAPI);
+        return NULL;
+    }
+    AUTO_DECREF(f);
 
-    int start, end;
-    if (exp) {
-        start = exp - 1;
-        end = dot;
-    } else {
-        start = n - 1;
-        end = dot + 2;
-    }
-    for (int i = start; i >= end; i--) {
-        if (buf[i] == '0') {
-            memmove(buf + i, buf + i + 1, n - i - 1);
-            n--;
-        } else if (buf[i] == '.') {
-            memmove(buf + i, buf + i + 1, n - i - 1);
-            n--;
-            break;
-        } else {
-            break;
-        }
-    }
-    return std::string(buf, n);
+    return new (cls) BoxedFloat(f->d);
 }
 
-Box* floatNew(BoxedClass* cls, Box* a) {
-    assert(cls == float_cls);
+// Roughly analogous to CPython's float_new.
+// The arguments need to be unpacked from args and kwds.
+static Box* floatNewPacked(BoxedClass* type, Box* args, Box* kwds) noexcept {
+    PyObject* x
+        = Py_False; // False is like initalizing it to 0.0 but faster because we don't need to box it in case the
+                    // optional arg exists
+    static char* kwlist[2] = { NULL, NULL };
+    kwlist[0] = const_cast<char*>("x");
 
-    if (a->cls == float_cls) {
-        return a;
-    } else if (a->cls == int_cls) {
-        return boxFloat(static_cast<BoxedInt*>(a)->n);
-    } else if (a->cls == str_cls) {
-        const std::string& s = static_cast<BoxedString*>(a)->s;
-        if (s == "nan")
-            return boxFloat(NAN);
-        if (s == "-nan")
-            return boxFloat(-NAN);
-        if (s == "inf")
-            return boxFloat(INFINITY);
-        if (s == "-inf")
-            return boxFloat(-INFINITY);
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O:float", kwlist, &x))
+        return NULL;
 
-        return boxFloat(strtod(s.c_str(), NULL));
+    return floatNew<CAPI>(type, x);
+}
+
+PyObject* float_str_or_repr(double v, int precision, char format_code) {
+    PyObject* result;
+    char* buf = PyOS_double_to_string(v, format_code, precision, Py_DTSF_ADD_DOT_0, NULL);
+    if (!buf)
+        return PyErr_NoMemory();
+    result = PyString_FromString(buf);
+    PyMem_Free(buf);
+    return result;
+}
+
+extern "C" Box* floatFloat(BoxedFloat* self) {
+    if (!PyFloat_Check(self))
+        raiseExcHelper(TypeError, "descriptor '__float__' requires a 'float' object but received a '%s'",
+                       getTypeName(self));
+
+    if (self->cls == float_cls)
+        return incref(self);
+    return boxFloat(self->d);
+}
+
+template <ExceptionStyle S> Box* floatStr(BoxedFloat* self) noexcept(S == CAPI) {
+    if (!PyFloat_Check(self))
+        return setDescrTypeError<S>(self, "float", "__str__");
+    return callCAPIFromStyle<S>(float_str_or_repr, self->d, PyFloat_STR_PRECISION, 'g');
+}
+
+template <ExceptionStyle S> Box* floatRepr(BoxedFloat* self) noexcept(S == CAPI) {
+    if (!PyFloat_Check(self))
+        return setDescrTypeError<S>(self, "float", "__repr__");
+    return callCAPIFromStyle<S>(float_str_or_repr, self->d, 0, 'r');
+}
+
+Box* float_to_int(BoxedFloat* self) noexcept {
+    double wholepart; /* integral portion of x, rounded toward 0 */
+
+    (void)modf(self->d, &wholepart);
+    /* Try to get out cheap if this fits in a Python int.  The attempt
+     * to cast to long must be protected, as C doesn't define what
+     * happens if the double is too big to fit in a long.  Some rare
+     * systems raise an exception then (RISCOS was mentioned as one,
+     * and someone using a non-default option on Sun also bumped into
+     * that).  Note that checking for <= LONG_MAX is unsafe: if a long
+     * has more bits of precision than a double, casting LONG_MAX to
+     * double may yield an approximation, and if that's rounded up,
+     * then, e.g., wholepart=LONG_MAX+1 would yield true from the C
+     * expression wholepart<=LONG_MAX, despite that wholepart is
+     * actually greater than LONG_MAX.  However, assuming a two's complement
+     * machine with no trap representation, LONG_MIN will be a power of 2 (and
+     * hence exactly representable as a double), and LONG_MAX = -1-LONG_MIN, so
+     * the comparisons with (double)LONG_MIN below should be safe.
+     */
+    if ((double)LONG_MIN <= wholepart && wholepart < -(double)LONG_MIN) {
+        const long aslong = (long)wholepart;
+        return PyInt_FromLong(aslong);
     }
-    RELEASE_ASSERT(0, "%s", getTypeName(a)->c_str());
+    return PyLong_FromDouble(wholepart);
 }
 
-Box* floatStr(BoxedFloat* self) {
-    assert(self->cls == float_cls);
-    return boxString(floatFmt(self->d, 12, 'g'));
+Box* floatTrunc(BoxedFloat* self) {
+    if (!PyFloat_Check(self))
+        raiseExcHelper(TypeError, "descriptor '__trunc__' requires a 'float' object but received a '%s'",
+                       getTypeName(self));
+
+    return float_to_int(self);
 }
 
-Box* floatRepr(BoxedFloat* self) {
-    assert(self->cls == float_cls);
-    return boxString(floatFmt(self->d, 16, 'g'));
+Box* floatInt(BoxedFloat* self) {
+    if (!PyFloat_Check(self))
+        raiseExcHelper(TypeError, "descriptor '__int__' requires a 'float' object but received a '%s'",
+                       getTypeName(self));
+    return float_to_int(self);
 }
 
-extern "C" void printFloat(double d) {
-    std::string s = floatFmt(d, 12, 'g');
-    printf("%s", s.c_str());
+Box* floatLong(BoxedFloat* self) {
+    if (!PyFloat_Check(self))
+        raiseExcHelper(TypeError, "descriptor '__long__' requires a 'float' object but received a '%s'",
+                       getTypeName(self));
+
+    double x = PyFloat_AsDouble(self);
+    return PyLong_FromDouble(x);
+}
+
+Box* floatCoerce(BoxedFloat* _self, Box* other) {
+    if (!PyFloat_Check(_self))
+        raiseExcHelper(TypeError, "descriptor '__coerce__' requires a 'float' object but received a '%s'",
+                       getTypeName(_self));
+
+    Box* self = static_cast<Box*>(_self);
+    int result = float_coerce(&self, &other);
+    if (result == 0) {
+        AUTO_DECREF(self);
+        AUTO_DECREF(other);
+        return BoxedTuple::create({ self, other });
+    } else if (result == 1)
+        return incref(NotImplemented);
+    else
+        throwCAPIException();
+}
+
+Box* floatHash(BoxedFloat* self) {
+    if (!PyFloat_Check(self))
+        raiseExcHelper(TypeError, "descriptor '__hash__' requires a 'float' object but received a '%s'",
+                       getTypeName(self));
+
+    return boxInt(_Py_HashDouble(self->d));
 }
 
 static void _addFunc(const char* name, ConcreteCompilerType* rtn_type, void* float_func, void* int_func,
                      void* boxed_func) {
-    std::vector<ConcreteCompilerType*> v_ff, v_fi, v_fu;
+    std::vector<ConcreteCompilerType*> v_ff, v_fi, v_uu;
     v_ff.push_back(BOXED_FLOAT);
     v_ff.push_back(BOXED_FLOAT);
     v_fi.push_back(BOXED_FLOAT);
     v_fi.push_back(BOXED_INT);
-    v_fu.push_back(BOXED_FLOAT);
-    v_fu.push_back(UNKNOWN);
+    v_uu.push_back(UNKNOWN);
+    v_uu.push_back(UNKNOWN);
 
-    CLFunction* cl = createRTFunction(2, 0, false, false);
-    addRTFunction(cl, float_func, rtn_type, v_ff);
-    addRTFunction(cl, int_func, rtn_type, v_fi);
-    addRTFunction(cl, boxed_func, UNKNOWN, v_fu);
-    float_cls->giveAttr(name, new BoxedFunction(cl));
+    BoxedCode* code = new BoxedCode(2, false, false, name);
+    code->addVersion(float_func, rtn_type, v_ff);
+    code->addVersion(int_func, rtn_type, v_fi);
+    code->addVersion(boxed_func, UNKNOWN, v_uu);
+    float_cls->giveAttr(name, new BoxedFunction(code));
 }
 
+static void _addFuncPow(const char* name, ConcreteCompilerType* rtn_type, void* float_func, void* int_func,
+                        void* boxed_func) {
+    std::vector<ConcreteCompilerType*> v_ffu{ BOXED_FLOAT, BOXED_FLOAT, UNKNOWN };
+    std::vector<ConcreteCompilerType*> v_fiu{ BOXED_FLOAT, BOXED_INT, UNKNOWN };
+    std::vector<ConcreteCompilerType*> v_fuu{ BOXED_FLOAT, UNKNOWN, UNKNOWN };
+
+    BoxedCode* code = new BoxedCode(3, false, false, name);
+    code->addVersion(float_func, rtn_type, v_ffu);
+    code->addVersion(int_func, rtn_type, v_fiu);
+    code->addVersion(boxed_func, UNKNOWN, v_fuu);
+    float_cls->giveAttr(name, new BoxedFunction(code, { Py_None }));
+}
+
+static Box* float_conjugate(Box* b, void*) noexcept {
+    if (!PyFloat_Check(b)) {
+        PyErr_Format(TypeError, "descriptor 'conjugate' requires a 'float' object but received a '%s'", getTypeName(b));
+        return NULL;
+    }
+    if (b->cls == float_cls) {
+        return incref(b);
+    } else {
+        assert(PyFloat_Check(b));
+        return boxFloat(static_cast<BoxedFloat*>(b)->d);
+    }
+}
+
+static Box* float0(Box*, void*) noexcept {
+    return boxFloat(0.0);
+}
+
+PyDoc_STRVAR(float_getformat_doc, "float.__getformat__(typestr) -> string\n"
+                                  "\n"
+                                  "You probably don't want to use this function.  It exists mainly to be\n"
+                                  "used in Python's test suite.\n"
+                                  "\n"
+                                  "typestr must be 'double' or 'float'.  This function returns whichever of\n"
+                                  "'unknown', 'IEEE, big-endian' or 'IEEE, little-endian' best describes the\n"
+                                  "format of floating point numbers used by the C type named by typestr.");
+
+PyDoc_STRVAR(float_setformat_doc, "float.__setformat__(typestr, fmt) -> None\n"
+                                  "\n"
+                                  "You probably don't want to use this function.  It exists mainly to be\n"
+                                  "used in Python's test suite.\n"
+                                  "\n"
+                                  "typestr must be 'double' or 'float'.  fmt must be one of 'unknown',\n"
+                                  "'IEEE, big-endian' or 'IEEE, little-endian', and in addition can only be\n"
+                                  "one of the latter two if it appears to match the underlying C reality.\n"
+                                  "\n"
+                                  "Override the automatic determination of C-level floating point type.\n"
+                                  "This affects how floats are converted to and from binary strings.");
+
+static PyMethodDef float_methods[]
+    = { { "hex", (PyCFunction)float_hex, METH_NOARGS, NULL },
+        { "fromhex", (PyCFunction)float_fromhex, METH_O | METH_CLASS, NULL },
+        { "as_integer_ratio", (PyCFunction)float_as_integer_ratio, METH_NOARGS, NULL },
+        { "__getformat__", (PyCFunction)float_getformat, METH_O | METH_CLASS, float_getformat_doc },
+        { "__setformat__", (PyCFunction)float_setformat, METH_VARARGS | METH_CLASS, float_setformat_doc },
+        { "is_integer", (PyCFunction)float_is_integer, METH_NOARGS, NULL },
+        { "__format__", (PyCFunction)float__format__, METH_VARARGS, NULL },
+        { NULL, NULL, 0, NULL } };
+
 void setupFloat() {
-    float_cls->giveAttr("__name__", boxStrConstant("float"));
+    static PyNumberMethods float_as_number;
+    float_cls->tp_as_number = &float_as_number;
+
+    float_cls->giveAttr("__getnewargs__",
+                        new BoxedFunction(BoxedCode::create((void*)float_getnewargs, UNKNOWN, 1, "float.__getnewargs__",
+                                                            "", ParamNames::empty(), CAPI)));
 
     _addFunc("__add__", BOXED_FLOAT, (void*)floatAddFloat, (void*)floatAddInt, (void*)floatAdd);
-    float_cls->giveAttr("__radd__", float_cls->getattr("__add__"));
+    float_cls->giveAttrBorrowed("__radd__", float_cls->getattr(autoDecref(internStringMortal("__add__"))));
 
     _addFunc("__div__", BOXED_FLOAT, (void*)floatDivFloat, (void*)floatDivInt, (void*)floatDiv);
     _addFunc("__rdiv__", BOXED_FLOAT, (void*)floatRDivFloat, (void*)floatRDivInt, (void*)floatRDiv);
     _addFunc("__floordiv__", BOXED_FLOAT, (void*)floatFloorDivFloat, (void*)floatFloorDivInt, (void*)floatFloorDiv);
+    float_cls->giveAttr("__rfloordiv__",
+                        new BoxedFunction(BoxedCode::create((void*)floatRFloorDiv, UNKNOWN, 2, "float.__rfloordiv__")));
     _addFunc("__truediv__", BOXED_FLOAT, (void*)floatDivFloat, (void*)floatDivInt, (void*)floatTruediv);
-
-    _addFunc("__eq__", BOXED_BOOL, (void*)floatEqFloat, (void*)floatEqInt, (void*)floatEq);
-    _addFunc("__ge__", BOXED_BOOL, (void*)floatGeFloat, (void*)floatGeInt, (void*)floatGe);
-    _addFunc("__gt__", BOXED_BOOL, (void*)floatGtFloat, (void*)floatGtInt, (void*)floatGt);
-    _addFunc("__le__", BOXED_BOOL, (void*)floatLeFloat, (void*)floatLeInt, (void*)floatLe);
-    _addFunc("__lt__", BOXED_BOOL, (void*)floatLtFloat, (void*)floatLtInt, (void*)floatLt);
-    _addFunc("__ne__", BOXED_BOOL, (void*)floatNeFloat, (void*)floatNeInt, (void*)floatNe);
+    float_cls->giveAttr("__rtruediv__",
+                        new BoxedFunction(BoxedCode::create((void*)floatRTruediv, UNKNOWN, 2, "float.__rtruediv__")));
 
     _addFunc("__mod__", BOXED_FLOAT, (void*)floatModFloat, (void*)floatModInt, (void*)floatMod);
     _addFunc("__rmod__", BOXED_FLOAT, (void*)floatRModFloat, (void*)floatRModInt, (void*)floatRMod);
     _addFunc("__mul__", BOXED_FLOAT, (void*)floatMulFloat, (void*)floatMulInt, (void*)floatMul);
-    float_cls->giveAttr("__rmul__", float_cls->getattr("__mul__"));
+    float_cls->giveAttrBorrowed("__rmul__", float_cls->getattr(autoDecref(internStringMortal("__mul__"))));
 
-    _addFunc("__pow__", BOXED_FLOAT, (void*)floatPowFloat, (void*)floatPowInt, (void*)floatPow);
+    _addFuncPow("__pow__", BOXED_FLOAT, (void*)floatPowFloat, (void*)floatPowInt, (void*)floatPow);
+    float_cls->giveAttr("__rpow__",
+                        new BoxedFunction(BoxedCode::create((void*)floatRPow, UNKNOWN, 2, "float.__rpow__")));
     _addFunc("__sub__", BOXED_FLOAT, (void*)floatSubFloat, (void*)floatSubInt, (void*)floatSub);
     _addFunc("__rsub__", BOXED_FLOAT, (void*)floatRSubFloat, (void*)floatRSubInt, (void*)floatRSub);
+    float_cls->giveAttr("__divmod__",
+                        new BoxedFunction(BoxedCode::create((void*)floatDivmod, UNKNOWN, 2, "float.__divmod__")));
+    float_cls->giveAttr("__rdivmod__",
+                        new BoxedFunction(BoxedCode::create((void*)floatRDivmod, UNKNOWN, 2, "float.__rdivmod__")));
 
-    float_cls->giveAttr(
-        "__new__", new BoxedFunction(boxRTFunction((void*)floatNew, UNKNOWN, 2, 1, false, false), { boxFloat(0.0) }));
+    auto float_new = BoxedCode::create((void*)floatNew<CXX>, UNKNOWN, 2, false, false, "float.__new__", "",
+                                       ParamNames({ "", "x" }, "", ""), CXX);
+    float_new->addVersion((void*)floatNew<CAPI>, UNKNOWN, CAPI);
+    float_cls->giveAttr("__new__", new BoxedFunction(float_new, { autoDecref(boxFloat(0.0)) }));
 
-    float_cls->giveAttr("__neg__", new BoxedFunction(boxRTFunction((void*)floatNeg, BOXED_FLOAT, 1)));
+    float_cls->giveAttr("__eq__", new BoxedFunction(BoxedCode::create((void*)floatEq, UNKNOWN, 2, "float.__eq__")));
+    float_cls->giveAttr("__ne__", new BoxedFunction(BoxedCode::create((void*)floatNe, UNKNOWN, 2, "float.__ne__")));
+    float_cls->giveAttr("__le__", new BoxedFunction(BoxedCode::create((void*)floatLe, UNKNOWN, 2, "float.__le__")));
+    float_cls->giveAttr("__lt__", new BoxedFunction(BoxedCode::create((void*)floatLt, UNKNOWN, 2, "float.__lt__")));
+    float_cls->giveAttr("__ge__", new BoxedFunction(BoxedCode::create((void*)floatGe, UNKNOWN, 2, "float.__ge__")));
+    float_cls->giveAttr("__gt__", new BoxedFunction(BoxedCode::create((void*)floatGt, UNKNOWN, 2, "float.__gt__")));
+    float_cls->giveAttr("__neg__",
+                        new BoxedFunction(BoxedCode::create((void*)floatNeg, BOXED_FLOAT, 1, "float.__neg__")));
+    float_cls->giveAttr("__pos__",
+                        new BoxedFunction(BoxedCode::create((void*)floatPos, BOXED_FLOAT, 1, "float.__pos__")));
+    float_cls->giveAttr("__abs__",
+                        new BoxedFunction(BoxedCode::create((void*)floatAbs, BOXED_FLOAT, 1, "float.__abs__")));
 
-    CLFunction* nonzero = boxRTFunction((void*)floatNonzeroUnboxed, BOOL, 1);
-    addRTFunction(nonzero, (void*)floatNonzero, UNKNOWN);
+    BoxedCode* nonzero = BoxedCode::create((void*)floatNonzeroUnboxed, BOOL, 1, "float.__nonzero__");
+    nonzero->addVersion((void*)floatNonzero, UNKNOWN);
     float_cls->giveAttr("__nonzero__", new BoxedFunction(nonzero));
 
-    // float_cls->giveAttr("__nonzero__", new BoxedFunction(boxRTFunction((void*)floatNonzero, NULL, 1)));
-    float_cls->giveAttr("__str__", new BoxedFunction(boxRTFunction((void*)floatStr, STR, 1)));
-    float_cls->giveAttr("__repr__", new BoxedFunction(boxRTFunction((void*)floatRepr, STR, 1)));
-    float_cls->freeze();
-}
+    // float_cls->giveAttr("__nonzero__", new BoxedFunction(BoxedCode::create((void*)floatNonzero, NULL, 1,
+    // "float.__nonzero__")));
+    float_cls->giveAttr("__float__",
+                        new BoxedFunction(BoxedCode::create((void*)floatFloat, BOXED_FLOAT, 1, "float.__float__")));
+    float_cls->giveAttr("__str__", new BoxedFunction(BoxedCode::create((void*)floatStr<CXX>, STR, 1, "float.__str__")));
+    float_cls->giveAttr("__repr__",
+                        new BoxedFunction(BoxedCode::create((void*)floatRepr<CXX>, STR, 1, "float.__repr__")));
+    float_cls->giveAttr("__coerce__",
+                        new BoxedFunction(BoxedCode::create((void*)floatCoerce, UNKNOWN, 2, "float.__coerce__")));
 
-void teardownFloat() {
+    float_cls->giveAttr("__trunc__",
+                        new BoxedFunction(BoxedCode::create((void*)floatTrunc, UNKNOWN, 1, "float.__trunc__")));
+    float_cls->giveAttr("__int__", new BoxedFunction(BoxedCode::create((void*)floatInt, UNKNOWN, 1, "float.__int__")));
+    float_cls->giveAttr("__long__",
+                        new BoxedFunction(BoxedCode::create((void*)floatLong, UNKNOWN, 1, "float.__long__")));
+    float_cls->giveAttr("__hash__",
+                        new BoxedFunction(BoxedCode::create((void*)floatHash, BOXED_INT, 1, "float.__hash__")));
+
+    float_cls->giveAttrDescriptor("real", float_conjugate, NULL);
+    float_cls->giveAttrDescriptor("imag", float0, NULL);
+    float_cls->giveAttr("conjugate",
+                        new BoxedFunction(BoxedCode::create((void*)float_conjugate, BOXED_FLOAT, 1, "float.conjugate",
+                                                            "", ParamNames::empty(), CAPI)));
+
+    float_cls->giveAttr("__doc__", boxString("float(x) -> floating point number\n"
+                                             "\n"
+                                             "Convert a string or number to a floating point number, if possible."));
+
+    add_methods(float_cls, float_methods);
+
+    add_operators(float_cls);
+    float_cls->freeze();
+
+    _PyFloat_Init();
+
+    float_cls->tp_new = (newfunc)floatNewPacked;
+    float_cls->tp_repr = (reprfunc)floatRepr<CAPI>;
+    float_cls->tp_str = (reprfunc)floatStr<CAPI>;
+    float_cls->tp_richcompare = float_richcompare;
+    float_cls->tp_as_number->nb_int = (unaryfunc)float_to_int;
+    float_cls->tp_as_number->nb_power = float_pow;
 }
 }

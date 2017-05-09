@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,23 @@
 // This file is for forcing the inclusion of function declarations into the stdlib.
 // This is so that the types of the functions are available to the compiler.
 
+#include "codegen/ast_interpreter.h"
+#include "codegen/irgen/hooks.h"
+#include "core/threading.h"
 #include "core/types.h"
-#include "gc/heap.h"
 #include "runtime/complex.h"
 #include "runtime/float.h"
 #include "runtime/generator.h"
 #include "runtime/import.h"
 #include "runtime/inline/boxing.h"
+#include "runtime/inline/list.h"
 #include "runtime/int.h"
 #include "runtime/list.h"
 #include "runtime/long.h"
 #include "runtime/objmodel.h"
 #include "runtime/set.h"
 #include "runtime/types.h"
+#include "runtime/util.h"
 
 namespace pyston {
 
@@ -35,27 +39,24 @@ static void forceLink(void* x) {
     printf("%p\n", x);
 }
 
-extern "C" void __py_personality_v0() {
-    RELEASE_ASSERT(0, "not used");
-}
-
-
 namespace _force {
+
+// Create dummy objects of these types to make sure the types make it into the stdlib:
+FrameInfo* _frameinfo_forcer;
+AST_stmt* _asttmt_forcer;
 
 #define FORCE(name) forceLink((void*)name)
 void force() {
-    FORCE(softspace);
     FORCE(my_assert);
 
     FORCE(boxInt);
     FORCE(unboxInt);
     FORCE(boxFloat);
     FORCE(unboxFloat);
-    FORCE(boxStringPtr);
-    FORCE(boxCLFunction);
-    FORCE(unboxCLFunction);
+    FORCE(createFunctionFromMetadata);
     FORCE(boxInstanceMethod);
     FORCE(boxBool);
+    FORCE(boxBoolNegated);
     FORCE(unboxBool);
     FORCE(createTuple);
     FORCE(createDict);
@@ -67,8 +68,15 @@ void force() {
     FORCE(createLong);
     FORCE(createPureImaginary);
     FORCE(createSet);
+    FORCE(decodeUTF8StringPtr);
+    FORCE(initFrame);
+    FORCE(deinitFrame);
+    FORCE(deinitFrameMaybe);
+    FORCE(makePendingCalls);
+    FORCE(setFrameExcInfo);
 
     FORCE(getattr);
+    FORCE(getattr_capi);
     FORCE(setattr);
     FORCE(delattr);
     FORCE(nonzero);
@@ -77,9 +85,11 @@ void force() {
     FORCE(augbinop);
     FORCE(unboxedLen);
     FORCE(getitem);
+    FORCE(getitem_capi);
     FORCE(getclsattr);
     FORCE(getGlobal);
     FORCE(delGlobal);
+    FORCE(setGlobal);
     FORCE(setitem);
     FORCE(delitem);
     FORCE(unaryop);
@@ -88,25 +98,49 @@ void force() {
     FORCE(importStar);
     FORCE(repr);
     FORCE(str);
-    FORCE(isinstance);
-    FORCE(yield);
-    FORCE(getiter);
+    FORCE(exceptionMatches);
+    FORCE(yield_capi);
+    FORCE(getiterHelper);
+    FORCE(hasnext);
+    FORCE(apply_slice);
+    FORCE(applySlice);
+    FORCE(assignSlice);
 
     FORCE(unpackIntoArray);
     FORCE(raiseAttributeError);
     FORCE(raiseAttributeErrorStr);
+    FORCE(raiseAttributeErrorCapi);
+    FORCE(raiseAttributeErrorStrCapi);
+    FORCE(raiseIndexErrorStr);
+    FORCE(raiseIndexErrorStrCapi);
     FORCE(raiseNotIterableError);
     FORCE(assertNameDefined);
+    FORCE(assertFailDerefNameDefined);
     FORCE(assertFail);
+    FORCE(printExprHelper);
+    FORCE(printHelper);
 
-    FORCE(printFloat);
     FORCE(listAppendInternal);
+    FORCE(dictSetInternal);
 
     FORCE(runtimeCall);
+    FORCE(runtimeCallCapi);
     FORCE(callattr);
+    FORCE(callattrCapi);
 
     FORCE(raise0);
+    FORCE(raise0_capi);
     FORCE(raise3);
+    FORCE(raise3_capi);
+    FORCE(rawReraise);
+    FORCE(PyErr_Fetch);
+    FORCE(PyErr_NormalizeException);
+    FORCE(PyErr_Restore);
+    FORCE(caughtCapiException);
+    FORCE(reraiseCapiExcAsCxx);
+    FORCE(deopt);
+    FORCE(checkRefs);
+    FORCE(xdecrefAndRethrow);
 
     FORCE(div_i64_i64);
     FORCE(mod_i64_i64);
@@ -117,11 +151,19 @@ void force() {
     FORCE(mod_float_float);
     FORCE(pow_float_float);
 
+    FORCE(exec);
+
+    FORCE(dump);
+
     FORCE(boxFloat);
 
     FORCE(createModule);
 
-    FORCE(gc::sizes);
+    FORCE(boxedLocalsSet);
+    FORCE(boxedLocalsGet);
+    FORCE(boxedLocalsDel);
+
+    FORCE(threading::allowGLReadPreemption);
 
     // FORCE(listIter);
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <string>
 
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormattedStream.h"
@@ -26,7 +29,12 @@
 
 namespace pyston {
 
+#if !DISABLE_TIMERS
+
 int Timer::level = 0;
+
+Timer::Timer(long min_usec) : min_usec(min_usec), ended(true) {
+}
 
 Timer::Timer(const char* desc, long min_usec) : min_usec(min_usec), ended(true) {
     restart(desc);
@@ -36,7 +44,7 @@ void Timer::restart(const char* newdesc) {
     assert(ended);
 
     desc = newdesc;
-    gettimeofday(&start_time, NULL);
+    start_time = getCPUTicks();
     Timer::level++;
     ended = false;
 }
@@ -46,14 +54,14 @@ void Timer::restart(const char* newdesc, long new_min_usec) {
     restart(newdesc);
 }
 
-long Timer::end() {
+uint64_t Timer::end(uint64_t* ended_at) {
     if (!ended) {
-        timeval end;
-        gettimeofday(&end, NULL);
-        long us = 1000000L * (end.tv_sec - start_time.tv_sec) + (end.tv_usec - start_time.tv_usec);
-
+        uint64_t end = getCPUTicks();
+        uint64_t duration = end - start_time;
         Timer::level--;
-        if (VERBOSITY("time") >= 1 && desc) {
+        if (VERBOSITY("time") >= 2 && desc) {
+            uint64_t us = (uint64_t)(duration / Stats::estimateCPUFreq());
+
             if (us > min_usec) {
                 for (int i = 0; i < Timer::level; i++) {
                     putchar(' ');
@@ -70,27 +78,23 @@ long Timer::end() {
                 fflush(stdout);
             }
         }
+        if (ended_at)
+            *ended_at = end;
         ended = true;
-        return us;
+        return duration;
     }
     return -1;
 }
 
 Timer::~Timer() {
-    end();
+    if (!ended) {
+        uint64_t t = end();
+        if (exit_callback)
+            exit_callback(t);
+    }
 }
 
-bool startswith(const std::string& s, const std::string& pattern) {
-    if (pattern.size() > s.size())
-        return false;
-    return s.compare(0, pattern.size(), pattern) == 0;
-}
-
-bool endswith(const std::string& s, const std::string& pattern) {
-    if (pattern.size() > s.size())
-        return false;
-    return s.compare(s.size() - pattern.size(), pattern.size(), pattern) == 0;
-}
+#endif // !DISABLE_TIMERS
 
 void removeDirectoryIfExists(const std::string& path) {
     llvm_error_code code;
@@ -112,7 +116,7 @@ void removeDirectoryIfExists(const std::string& path) {
         if (llvm::sys::fs::is_directory(status)) {
             removeDirectoryIfExists(it->path());
         } else {
-            if (VERBOSITY())
+            if (VERBOSITY() >= 2)
                 llvm::errs() << "Removing file " << it->path() << '\n';
             code = llvm::sys::fs::remove(it->path(), false);
             assert(!code);
@@ -122,7 +126,7 @@ void removeDirectoryIfExists(const std::string& path) {
         assert(!code);
     }
 
-    if (VERBOSITY())
+    if (VERBOSITY() >= 2)
         llvm::errs() << "Removing directory " << path << '\n';
     code = llvm::sys::fs::remove(path, false);
     assert(!code);

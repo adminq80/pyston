@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,11 +20,16 @@
 #include "llvm/Analysis/Passes.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/IR/Module.h"
+#if LLVMREV < 229094
 #include "llvm/PassManager.h"
+#else
+#include "llvm/IR/LegacyPassManager.h"
+#endif
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Scalar.h"
 
+#include "codegen/ast_interpreter.h"
 #include "codegen/codegen.h"
 #include "codegen/irgen.h"
 #include "codegen/irgen/hooks.h"
@@ -36,11 +41,13 @@
 #include "runtime/generator.h"
 #include "runtime/import.h"
 #include "runtime/inline/boxing.h"
+#include "runtime/inline/list.h"
 #include "runtime/int.h"
 #include "runtime/long.h"
 #include "runtime/objmodel.h"
 #include "runtime/set.h"
 #include "runtime/types.h"
+#include "runtime/util.h"
 
 extern "C" void* __cxa_begin_catch(void*);
 extern "C" void __cxa_end_catch();
@@ -115,9 +122,12 @@ static llvm::Value* addFunc(void* func, llvm::Type* rtn_type, llvm::Type* arg1, 
 void initGlobalFuncs(GlobalState& g) {
     g.llvm_opaque_type = llvm::StructType::create(g.context, "opaque");
 
-    g.llvm_clfunction_type_ptr = lookupFunction("boxCLFunction")->arg_begin()->getType();
     g.llvm_module_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedModule")->getPointerTo();
     assert(g.llvm_module_type_ptr);
+
+    g.llvm_code_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedCode")->getPointerTo();
+    assert(g.llvm_code_type_ptr);
+
     g.llvm_bool_type_ptr = lookupFunction("boxBool")->getReturnType();
 
     g.llvm_value_type_ptr = lookupFunction("getattr")->getReturnType();
@@ -129,7 +139,13 @@ void initGlobalFuncs(GlobalState& g) {
     assert(g.llvm_class_type);
     g.llvm_class_type_ptr = g.llvm_class_type->getPointerTo();
 
-    g.llvm_str_type_ptr = lookupFunction("boxStringPtr")->arg_begin()->getType();
+    g.llvm_boxedstring_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedString");
+    assert(g.llvm_boxedstring_type_ptr);
+    g.llvm_boxedstring_type_ptr = g.llvm_boxedstring_type_ptr->getPointerTo();
+
+    g.llvm_dict_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedDict");
+    assert(g.llvm_dict_type_ptr);
+    g.llvm_dict_type_ptr = g.llvm_dict_type_ptr->getPointerTo();
 
     // The LLVM vector type for the arguments that we pass to runtimeCall and related functions.
     // It will be a pointer to a type named something like class.std::vector or
@@ -143,6 +159,12 @@ void initGlobalFuncs(GlobalState& g) {
     g.llvm_generator_type_ptr = g.stdlib_module->getTypeByName("class.pyston::BoxedGenerator")->getPointerTo();
     assert(g.llvm_generator_type_ptr);
 
+    g.llvm_excinfo_type = g.stdlib_module->getTypeByName("struct.pyston::ExcInfo");
+    assert(g.llvm_excinfo_type);
+
+    g.llvm_frame_info_type = g.stdlib_module->getTypeByName("struct.pyston::FrameInfo");
+    assert(g.llvm_frame_info_type);
+
 #define GET(N) g.funcs.N = getFunc((void*)N, STRINGIFY(N))
 
     g.funcs.printf = addFunc((void*)printf, g.i8_ptr, true);
@@ -150,18 +172,14 @@ void initGlobalFuncs(GlobalState& g) {
     g.funcs.malloc = addFunc((void*)malloc, g.i8_ptr, g.i64);
     g.funcs.free = addFunc((void*)free, g.void_, g.i8_ptr);
 
-    g.funcs.allowGLReadPreemption = addFunc((void*)threading::allowGLReadPreemption, g.void_);
+    g.funcs.allowGLReadPreemption = getFunc((void*)threading::allowGLReadPreemption, "allowGLReadPreemption");
 
-    GET(softspace);
-
-    GET(boxCLFunction);
-    GET(unboxCLFunction);
+    GET(createFunctionFromMetadata);
     GET(createUserClass);
     GET(boxInt);
     GET(unboxInt);
     GET(boxFloat);
     GET(unboxFloat);
-    GET(boxStringPtr);
     GET(boxInstanceMethod);
     GET(boxBool);
     GET(unboxBool);
@@ -171,18 +189,24 @@ void initGlobalFuncs(GlobalState& g) {
     GET(createSlice);
     GET(createClosure);
     GET(createGenerator);
-    GET(createLong);
-    GET(createPureImaginary);
     GET(createSet);
+    GET(initFrame);
+    GET(deinitFrame);
+    GET(deinitFrameMaybe);
+    GET(makePendingCalls);
+    GET(setFrameExcInfo);
 
     GET(getattr);
+    GET(getattr_capi);
     GET(setattr);
     GET(delattr);
     GET(getitem);
+    GET(getitem_capi);
     GET(setitem);
     GET(delitem);
     GET(getGlobal);
     GET(delGlobal);
+    GET(setGlobal);
     GET(binop);
     GET(compare);
     GET(augbinop);
@@ -194,57 +218,119 @@ void initGlobalFuncs(GlobalState& g) {
     GET(importFrom);
     GET(importStar);
     GET(repr);
-    GET(str);
-    GET(isinstance);
-    GET(yield);
-    GET(getiter);
+    GET(exceptionMatches);
+    GET(yield_capi);
+    GET(getiterHelper);
+    GET(hasnext);
+    GET(apply_slice);
+    GET(applySlice);
+    GET(assignSlice);
 
     GET(unpackIntoArray);
     GET(raiseAttributeError);
     GET(raiseAttributeErrorStr);
+    GET(raiseAttributeErrorCapi);
+    GET(raiseAttributeErrorStrCapi);
+    GET(raiseIndexErrorStr);
+    GET(raiseIndexErrorStrCapi);
     GET(raiseNotIterableError);
     GET(assertNameDefined);
+    GET(assertFailDerefNameDefined);
     GET(assertFail);
+    GET(printExprHelper);
+    GET(printHelper);
 
-    GET(printFloat);
     GET(listAppendInternal);
 
-    g.funcs.runtimeCall = getFunc((void*)runtimeCall, "runtimeCall");
-    g.funcs.runtimeCall0 = addFunc((void*)runtimeCall, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32);
-    g.funcs.runtimeCall1
+    GET(exec);
+    GET(boxedLocalsSet);
+    GET(boxedLocalsGet);
+    GET(boxedLocalsDel);
+
+    g.funcs.runtimeCall.cxx_val = getFunc((void*)runtimeCall, "runtimeCall");
+    g.funcs.runtimeCall0.cxx_val = addFunc((void*)runtimeCall, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32);
+    g.funcs.runtimeCall1.cxx_val
         = addFunc((void*)runtimeCall, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32, g.llvm_value_type_ptr);
-    g.funcs.runtimeCall2 = addFunc((void*)runtimeCall, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32,
-                                   g.llvm_value_type_ptr, g.llvm_value_type_ptr);
-    g.funcs.runtimeCall3 = addFunc((void*)runtimeCall, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32,
-                                   g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
-    g.funcs.runtimeCallN
+    g.funcs.runtimeCall2.cxx_val = addFunc((void*)runtimeCall, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32,
+                                           g.llvm_value_type_ptr, g.llvm_value_type_ptr);
+    g.funcs.runtimeCall3.cxx_val = addFunc((void*)runtimeCall, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32,
+                                           g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
+    g.funcs.runtimeCallN.cxx_val
         = addFunc((void*)runtimeCall, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32, g.llvm_value_type_ptr,
                   g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr->getPointerTo());
 
-    g.funcs.callattr = getFunc((void*)callattr, "callattr");
-    g.funcs.callattr0
-        = addFunc((void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_str_type_ptr, g.i1, g.i32);
-    g.funcs.callattr1 = addFunc((void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_str_type_ptr,
-                                g.i1, g.i32, g.llvm_value_type_ptr);
-    g.funcs.callattr2 = addFunc((void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_str_type_ptr,
-                                g.i1, g.i32, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
-    g.funcs.callattr3 = addFunc((void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_str_type_ptr,
-                                g.i1, g.i32, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
-    g.funcs.callattrN = addFunc((void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_str_type_ptr,
-                                g.i1, g.i32, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr,
-                                g.llvm_value_type_ptr->getPointerTo());
+    g.funcs.runtimeCall.capi_val = getFunc((void*)runtimeCallCapi, "runtimeCallCapi");
+    g.funcs.runtimeCall0.capi_val
+        = addFunc((void*)runtimeCallCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32);
+    g.funcs.runtimeCall1.capi_val
+        = addFunc((void*)runtimeCallCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32, g.llvm_value_type_ptr);
+    g.funcs.runtimeCall2.capi_val = addFunc((void*)runtimeCallCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32,
+                                            g.llvm_value_type_ptr, g.llvm_value_type_ptr);
+    g.funcs.runtimeCall3.capi_val = addFunc((void*)runtimeCallCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32,
+                                            g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
+    g.funcs.runtimeCallN.capi_val
+        = addFunc((void*)runtimeCallCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.i32, g.llvm_value_type_ptr,
+                  g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr->getPointerTo());
+
+
+    g.funcs.callattr.cxx_val = getFunc((void*)callattr, "callattr");
+    g.funcs.callattr0.cxx_val
+        = addFunc((void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_boxedstring_type_ptr, g.i64);
+    g.funcs.callattr1.cxx_val = addFunc((void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr,
+                                        g.llvm_boxedstring_type_ptr, g.i64, g.llvm_value_type_ptr);
+    g.funcs.callattr2.cxx_val
+        = addFunc((void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_boxedstring_type_ptr, g.i64,
+                  g.llvm_value_type_ptr, g.llvm_value_type_ptr);
+    g.funcs.callattr3.cxx_val
+        = addFunc((void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_boxedstring_type_ptr, g.i64,
+                  g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
+    g.funcs.callattrN.cxx_val = addFunc(
+        (void*)callattr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_boxedstring_type_ptr, g.i64,
+        g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr->getPointerTo());
+
+
+    g.funcs.callattr.capi_val = getFunc((void*)callattrCapi, "callattrCapi");
+    g.funcs.callattr0.capi_val = addFunc((void*)callattrCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr,
+                                         g.llvm_boxedstring_type_ptr, g.i64);
+    g.funcs.callattr1.capi_val = addFunc((void*)callattrCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr,
+                                         g.llvm_boxedstring_type_ptr, g.i64, g.llvm_value_type_ptr);
+    g.funcs.callattr2.capi_val
+        = addFunc((void*)callattrCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_boxedstring_type_ptr, g.i64,
+                  g.llvm_value_type_ptr, g.llvm_value_type_ptr);
+    g.funcs.callattr3.capi_val
+        = addFunc((void*)callattrCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_boxedstring_type_ptr, g.i64,
+                  g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr);
+    g.funcs.callattrN.capi_val = addFunc(
+        (void*)callattrCapi, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_boxedstring_type_ptr, g.i64,
+        g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr, g.llvm_value_type_ptr->getPointerTo());
 
     g.funcs.reoptCompiledFunc = addFunc((void*)reoptCompiledFunc, g.i8_ptr, g.i8_ptr);
     g.funcs.compilePartialFunc = addFunc((void*)compilePartialFunc, g.i8_ptr, g.i8_ptr);
 
-    GET(__cxa_begin_catch);
     g.funcs.__cxa_end_catch = addFunc((void*)__cxa_end_catch, g.void_);
     GET(raise0);
+    GET(raise0_capi);
     GET(raise3);
+    GET(raise3_capi);
+    GET(rawReraise);
+    GET(PyErr_Fetch);
+    GET(PyErr_NormalizeException);
+    GET(PyErr_Restore);
+    GET(caughtCapiException);
+    GET(reraiseCapiExcAsCxx);
+    GET(deopt);
+    GET(checkRefs);
+    GET(xdecrefAndRethrow);
 
     GET(div_float_float);
     GET(floordiv_float_float);
     GET(mod_float_float);
     GET(pow_float_float);
+
+    GET(dump);
+
+#ifdef Py_TRACE_REFS
+    GET(_Py_Dealloc);
+#endif
 }
 }

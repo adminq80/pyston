@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 #ifndef PYSTON_RUNTIME_LONG_H
 #define PYSTON_RUNTIME_LONG_H
 
+#include <cstddef>
 #include <gmp.h>
 
 #include "core/types.h"
@@ -30,10 +31,14 @@ class BoxedLong : public Box {
 public:
     mpz_t n;
 
-    BoxedLong(BoxedClass* cls) __attribute__((visibility("default"))) : Box(cls) {}
+    BoxedLong() __attribute__((visibility("default"))) {}
+
+    static void tp_dealloc(Box* b) noexcept;
+
+    DEFAULT_CLASS_SIMPLE(long_cls, false);
 };
 
-extern "C" Box* createLong(const std::string* s);
+extern "C" Box* createLong(llvm::StringRef s);
 extern "C" BoxedLong* boxLong(int64_t n);
 
 Box* longNeg(BoxedLong* lhs);
@@ -43,7 +48,16 @@ Box* longAdd(BoxedLong* lhs, Box* rhs);
 Box* longSub(BoxedLong* lhs, Box* rhs);
 Box* longMul(BoxedLong* lhs, Box* rhs);
 Box* longDiv(BoxedLong* lhs, Box* rhs);
-Box* longPow(BoxedLong* lhs, Box* rhs);
+Box* longPow(BoxedLong* lhs, Box* rhs, Box* mod = Py_None);
+Box* longLShiftLong(BoxedLong* lhs, Box* _rhs);
+Box* longRShiftLong(BoxedLong* lhs, Box* _rhs);
+
+Box* longHex(BoxedLong* v);
+Box* longOct(BoxedLong* v);
+Box* longStr(BoxedLong* v);
+Box* longInt(Box* v);
+
+bool longNonzeroUnboxed(BoxedLong* n);
 }
 
 #endif

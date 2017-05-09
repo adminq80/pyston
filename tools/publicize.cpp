@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -89,7 +89,23 @@ bool makeVisible(llvm::GlobalValue* gv) {
     if (visibility == llvm::GlobalValue::HiddenVisibility) {
         gv->setVisibility(llvm::GlobalValue::ProtectedVisibility);
         //gv->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
-        gv->setName(gv->getName() + "_protected");
+        std::string old_name = gv->getName();
+        std::string new_name = (gv->getName() + "_protected").str();
+        gv->setName(new_name);
+
+#if LLVMREV >= 225705
+        // If this symbol has comdat set we have to remove the comdat for the old name
+        // and create a new comdat with the new name
+        if (gv->hasComdat() && isa<llvm::GlobalObject>(gv)) {
+            llvm::Module* mod = gv->getParent();
+            llvm::GlobalObject* go = cast<llvm::GlobalObject>(gv);
+            llvm::Comdat* new_com = mod->getOrInsertComdat(new_name);
+            new_com->setSelectionKind(go->getComdat()->getSelectionKind());
+            go->setComdat(new_com);
+            auto& Comdats = mod->getComdatSymbolTable();
+            Comdats.erase(Comdats.find(old_name));
+        }
+#endif
 
         changed = true;
     }
@@ -129,23 +145,27 @@ bool updateTBAA(Function* f) {
     LLVMContext &c = f->getContext();
 
     for (auto it = inst_begin(f), end = inst_end(f); it != end; ++it) {
+#if LLVMREV < 221024 || LLVMREV >= 221711
+        MDNode *tbaa = it->getMetadata(LLVMContext::MD_tbaa);
+#else
         MDNode *tbaa = it->getMDNode(LLVMContext::MD_tbaa);
+#endif
         if (!tbaa)
             continue;
         //tbaa->dump();
 
         assert(tbaa->getNumOperands() == 3);
 
-        if (!isConstant(llvm::cast<MDNode>(tbaa->getOperand(0)), llvm::cast<ConstantInt>(tbaa->getOperand(2))->getSExtValue())) {
+        if (!isConstant(llvm::cast<MDNode>(tbaa->getOperand(0)), llvm::cast<ConstantInt>(llvm::cast<ConstantAsMetadata>(tbaa->getOperand(2))->getValue())->getSExtValue())) {
             continue;
         }
 
-        std::vector<Value*> operands;
+        std::vector<Metadata*> operands;
 
         for (int i = 0; i < tbaa->getNumOperands(); i++) {
             operands.push_back(tbaa->getOperand(i));
         }
-        operands.push_back(ConstantInt::get(Type::getInt64Ty(c), 1));
+        operands.push_back(ConstantAsMetadata::get(ConstantInt::get(Type::getInt64Ty(c), 1)));
 
         MDNode *new_tbaa = MDNode::get(c, operands);
         it->setMetadata(LLVMContext::MD_tbaa, new_tbaa);

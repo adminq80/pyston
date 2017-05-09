@@ -1,10 +1,6 @@
-# expected: fail
-# This test case currently fails because it prints the relative path to the .so
-# module rather than the absolute path.
-
 import basic_test
 
-print basic_test
+print type(basic_test)
 
 # TODO this should work even if we don't keep a reference to l;
 # it doesn't currently always work, but it sometimes works, so it's hard
@@ -22,5 +18,4 @@ class C(object):
 for i in xrange(100000):
     C()
 
-print "This will break"
 print basic_test.load()

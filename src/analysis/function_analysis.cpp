@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,9 +21,11 @@
 
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/StringSet.h"
 
 #include "analysis/fpc.h"
 #include "analysis/scoping_analysis.h"
+#include "codegen/osrentry.h"
 #include "core/ast.h"
 #include "core/cfg.h"
 #include "core/common.h"
@@ -31,10 +33,10 @@
 
 namespace pyston {
 
-class LivenessBBVisitor : public NoopASTVisitor {
+class LivenessBBVisitor : public NoopBSTVisitor {
 private:
     struct Status {
-        enum Usage {
+        enum Usage : char {
             NONE,
             USED,
             DEFINED,
@@ -50,120 +52,57 @@ private:
         }
     };
 
-    std::unordered_set<AST_Name*> kills;
-    std::unordered_map<int, AST_Name*> last_uses;
-
-    std::unordered_map<int, Status> statuses;
+    VRegMap<Status> statuses;
     LivenessAnalysis* analysis;
 
-    void _doLoad(const std::string& name, AST_Name* node) {
-        int id = analysis->getStringIndex(name);
-
-        Status& status = statuses[id];
+    void _doLoad(int vreg) {
+        Status& status = statuses[vreg];
         status.addUsage(Status::USED);
-
-        last_uses[id] = node;
     }
 
-    void _doStore(const std::string& name) {
-        int id = analysis->getStringIndex(name);
-
-        Status& status = statuses[id];
+    void _doStore(int vreg) {
+        assert(vreg >= 0);
+        Status& status = statuses[vreg];
         status.addUsage(Status::DEFINED);
-
-        auto it = last_uses.find(id);
-        if (it != last_uses.end()) {
-            kills.insert(it->second);
-            last_uses.erase(it);
-        }
     }
+
+    Status::Usage getStatusFirst(int vreg) const { return statuses[vreg].first; }
 
 public:
-    LivenessBBVisitor(LivenessAnalysis* analysis) : analysis(analysis) {}
+    LivenessBBVisitor(LivenessAnalysis* analysis)
+        : NoopBSTVisitor(analysis->code_constants),
+          statuses(analysis->cfg->getVRegInfo().getTotalNumOfVRegs()),
+          analysis(analysis) {}
 
-    bool firstIsUse(int idx) { return statuses[idx].first == Status::USED; }
+    bool firstIsUse(int vreg) const { return getStatusFirst(vreg) == Status::USED; }
+    bool firstIsDef(int vreg) const { return getStatusFirst(vreg) == Status::DEFINED; }
 
-    bool firstIsDef(int idx) { return statuses[idx].first == Status::DEFINED; }
+    bool visit_vreg(int* vreg, bool is_dst) override {
+        if (*vreg >= 0) {
+            if (is_dst)
+                _doStore(*vreg);
+            else
+                _doLoad(*vreg);
+        }
+        return true;
+    }
 
-    bool isKilledAt(AST_Name* node, bool is_live_at_end) {
-        if (kills.count(node))
+    bool visit_deletename(BST_DeleteName* node) override {
+        if (node->vreg < 0 || node->vreg >= analysis->cfg->getVRegInfo().getNumOfUserVisibleVRegs())
             return true;
-
-        // If it's not live at the end, then the last use is a kill
-        // even though we weren't able to determine that in a single
-        // pass
-        if (!is_live_at_end) {
-            auto it = last_uses.find(analysis->getStringIndex(node->id));
-            if (it != last_uses.end() && node == it->second)
-                return true;
-        }
-
-        return false;
-    }
-
-
-
-    bool visit_classdef(AST_ClassDef* node) {
-        _doStore(node->name);
-
-        for (auto e : node->bases)
-            e->accept(this);
-        for (auto e : node->decorator_list)
-            e->accept(this);
-
-        return true;
-    }
-    bool visit_functiondef(AST_FunctionDef* node) {
-        for (auto* d : node->decorator_list)
-            d->accept(this);
-        node->args->accept(this);
-
-        _doStore(node->name);
-        return true;
-    }
-
-    bool visit_lambda(AST_Lambda* node) {
-        for (auto* d : node->args->defaults)
-            d->accept(this);
-        return true;
-    }
-
-    bool visit_name(AST_Name* node) {
-        if (node->ctx_type == AST_TYPE::Load)
-            _doLoad(node->id, node);
-        else if (node->ctx_type == AST_TYPE::Store || node->ctx_type == AST_TYPE::Del
-                 || node->ctx_type == AST_TYPE::Param)
-            _doStore(node->id);
-        else {
-            ASSERT(0, "%d", node->ctx_type);
-            abort();
-        }
-        return true;
-    }
-    bool visit_alias(AST_alias* node) {
-        const std::string* name = &node->name;
-        if (node->asname.size())
-            name = &node->asname;
-
-        _doStore(*name);
+        _doLoad(node->vreg);
+        _doStore(node->vreg);
         return true;
     }
 };
 
-int LivenessAnalysis::getStringIndex(const std::string& s) {
-    int& r = string_index_map[s];
-    if (r == 0) {
-        r = string_index_map.size(); // includes the '0' entry we just put in there
-    }
-    return r;
-}
-
-LivenessAnalysis::LivenessAnalysis(CFG* cfg) : cfg(cfg) {
-    Timer _t("LivenessAnalysis()", 10);
+LivenessAnalysis::LivenessAnalysis(CFG* cfg, const CodeConstants& code_constants)
+    : cfg(cfg), code_constants(code_constants), result_cache(cfg->getVRegInfo().getTotalNumOfVRegs()) {
+    Timer _t("LivenessAnalysis()", 100);
 
     for (CFGBlock* b : cfg->blocks) {
         auto visitor = new LivenessBBVisitor(this); // livenessCache unique_ptr will delete it.
-        for (AST_stmt* stmt : b->body) {
+        for (BST_stmt* stmt : *b) {
             stmt->accept(visitor);
         }
         liveness_cache.insert(std::make_pair(b, std::unique_ptr<LivenessBBVisitor>(visitor)));
@@ -173,32 +112,33 @@ LivenessAnalysis::LivenessAnalysis(CFG* cfg) : cfg(cfg) {
     us_liveness.log(_t.end());
 }
 
-bool LivenessAnalysis::isKill(AST_Name* node, CFGBlock* parent_block) {
-    if (node->id[0] != '#')
-        return false;
-
-    return liveness_cache[parent_block]->isKilledAt(node, isLiveAtEnd(node->id, parent_block));
+LivenessAnalysis::~LivenessAnalysis() {
 }
 
-bool LivenessAnalysis::isLiveAtEnd(const std::string& name, CFGBlock* block) {
-    Timer _t("LivenessAnalysis()", 10);
-
-    if (name[0] != '#')
+bool LivenessAnalysis::isLiveAtEnd(int vreg, CFGBlock* block) {
+    // Is a user-visible name, always live:
+    if (vreg < block->cfg->getVRegInfo().getNumOfUserVisibleVRegs())
         return true;
 
-    if (block->successors.size() == 0)
+#ifndef NDEBUG
+    if (block->cfg->getVRegInfo().isBlockLocalVReg(vreg))
+        return false;
+#endif
+
+    if (block->successors().size() == 0)
         return false;
 
-    int idx = getStringIndex(name);
-    if (!result_cache.count(idx)) {
-        std::unordered_map<CFGBlock*, bool>& map = result_cache[idx];
+    if (!result_cache[vreg].size()) {
+        Timer _t("LivenessAnalysis()", 10);
+
+        llvm::DenseMap<CFGBlock*, bool>& map = result_cache[vreg];
 
         // Approach:
         // - Find all uses (blocks where the status is USED)
         // - Trace backwards, marking all blocks as live-at-end
         // - If we hit a block that is DEFINED, stop
         for (CFGBlock* b : cfg->blocks) {
-            if (!liveness_cache[b]->firstIsUse(idx))
+            if (!liveness_cache[b]->firstIsUse(vreg))
                 continue;
 
             std::deque<CFGBlock*> q;
@@ -214,127 +154,100 @@ bool LivenessAnalysis::isLiveAtEnd(const std::string& name, CFGBlock* block) {
                     continue;
 
                 map[thisblock] = true;
-                if (!liveness_cache[thisblock]->firstIsDef(idx)) {
+                if (!liveness_cache[thisblock]->firstIsDef(vreg)) {
                     for (CFGBlock* pred : thisblock->predecessors) {
                         q.push_back(pred);
                     }
                 }
             }
         }
+
+        // Note: this one gets counted as part of us_compiling_irgen as well:
+        static StatCounter us_liveness("us_compiling_analysis_liveness");
+        us_liveness.log(_t.end());
     }
 
-    // Note: this one gets counted as part of us_compiling_irgen as well:
-    static StatCounter us_liveness("us_compiling_analysis_liveness");
-    us_liveness.log(_t.end());
+    // For block-local vregs, this query doesn't really make sense,
+    // since the vreg will be live but that's probably not what we care about.
+    // It's probably safe to return false, but let's just error for now.
+    if (block->cfg->getVRegInfo().isBlockLocalVReg(vreg)) {
+        ASSERT(!result_cache[vreg][block], "%d in %d", vreg, block->idx);
+        return false;
+    }
 
-    return result_cache[idx][block];
+    return result_cache[vreg][block];
 }
 
 class DefinednessBBAnalyzer : public BBAnalyzer<DefinednessAnalysis::DefinitionLevel> {
 private:
     typedef DefinednessAnalysis::DefinitionLevel DefinitionLevel;
 
-    CFG* cfg;
-    const SourceInfo::ArgNames& arg_names;
-
 public:
-    DefinednessBBAnalyzer(CFG* cfg, const SourceInfo::ArgNames& arg_names) : cfg(cfg), arg_names(arg_names) {}
+    DefinednessBBAnalyzer(const CodeConstants& code_constants)
+        : BBAnalyzer<DefinednessAnalysis::DefinitionLevel>(code_constants) {}
 
     virtual DefinitionLevel merge(DefinitionLevel from, DefinitionLevel into) const {
-        assert(from != DefinednessAnalysis::Undefined);
-        assert(into != DefinednessAnalysis::Undefined);
-        if (from == DefinednessAnalysis::PotentiallyDefined || into == DefinednessAnalysis::PotentiallyDefined)
-            return DefinednessAnalysis::PotentiallyDefined;
-        return DefinednessAnalysis::Defined;
-    }
-    virtual void processBB(Map& starting, CFGBlock* block) const;
-    virtual DefinitionLevel mergeBlank(DefinitionLevel into) const {
-        assert(into != DefinednessAnalysis::Undefined);
+        assert(from != DefinitionLevel::Unknown);
+        if (into == DefinitionLevel::Unknown)
+            return from;
+
+        if (into == DefinednessAnalysis::Undefined && from == DefinednessAnalysis::Undefined)
+            return DefinednessAnalysis::Undefined;
+
+        if (into == DefinednessAnalysis::Defined && from == DefinednessAnalysis::Defined)
+            return DefinednessAnalysis::Defined;
         return DefinednessAnalysis::PotentiallyDefined;
     }
+    virtual void processBB(Map& starting, CFGBlock* block) const;
 };
 
-class DefinednessVisitor : public ASTVisitor {
+class DefinednessVisitor : public NoopBSTVisitor {
 private:
     typedef DefinednessBBAnalyzer::Map Map;
     Map& state;
 
-    void _doSet(const std::string& s) { state[s] = DefinednessAnalysis::Defined; }
-
-    void _doSet(AST* t) {
-        switch (t->type) {
-            case AST_TYPE::Attribute:
-                // doesn't affect definedness (yet?)
-                break;
-            case AST_TYPE::Name:
-                _doSet(((AST_Name*)t)->id);
-                break;
-            case AST_TYPE::Subscript:
-                break;
-            case AST_TYPE::Tuple: {
-                AST_Tuple* tt = ast_cast<AST_Tuple>(t);
-                for (int i = 0; i < tt->elts.size(); i++) {
-                    _doSet(tt->elts[i]);
-                }
-                break;
-            }
-            default:
-                ASSERT(0, "Unknown type for DefinednessVisitor: %d", t->type);
-        }
+    void _doSet(int vreg) {
+        if (vreg == VREG_UNDEFINED)
+            return;
+        assert(vreg >= 0 && vreg < state.numVregs());
+        state[vreg] = DefinednessAnalysis::Defined;
     }
 
 public:
-    DefinednessVisitor(Map& state) : state(state) {}
+    DefinednessVisitor(const CodeConstants& code_constants, Map& state)
+        : NoopBSTVisitor(code_constants), state(state) {}
+    bool visit_vreg(int* vreg, bool is_dest) override {
+        if (*vreg < 0)
+            return false;
 
-    virtual bool visit_assert(AST_Assert* node) { return true; }
-    virtual bool visit_branch(AST_Branch* node) { return true; }
-    virtual bool visit_delete(AST_Delete* node) { return true; }
-    virtual bool visit_expr(AST_Expr* node) { return true; }
-    virtual bool visit_global(AST_Global* node) { return true; }
-    virtual bool visit_invoke(AST_Invoke* node) { return false; }
-    virtual bool visit_jump(AST_Jump* node) { return true; }
-    virtual bool visit_pass(AST_Pass* node) { return true; }
-    virtual bool visit_print(AST_Print* node) { return true; }
-    virtual bool visit_raise(AST_Raise* node) { return true; }
-    virtual bool visit_return(AST_Return* node) { return true; }
-    virtual bool visit_unreachable(AST_Unreachable* node) { return true; }
+        if (is_dest)
+            state[*vreg] = DefinednessAnalysis::Defined;
+        else
+            state[*vreg] = DefinednessAnalysis::Undefined;
+        return false;
+    }
 
-    virtual bool visit_classdef(AST_ClassDef* node) {
-        _doSet(node->name);
+    bool visit_deletename(BST_DeleteName* node) override {
+        if (node->lookup_type != ScopeInfo::VarScopeType::GLOBAL
+            && node->lookup_type != ScopeInfo::VarScopeType::NAME) {
+            assert(node->vreg >= 0);
+            state[node->vreg] = DefinednessAnalysis::Undefined;
+        } else
+            assert(node->vreg == VREG_UNDEFINED);
         return true;
     }
 
-    virtual bool visit_functiondef(AST_FunctionDef* node) {
-        _doSet(node->name);
+    bool visit_copyvreg(BST_CopyVReg* node) override {
+        // don't visit the vreg it will never get killed
+        // visit_vreg(&node->vreg_src, false);
+        _doSet(node->vreg_dst);
         return true;
     }
 
-    virtual bool visit_alias(AST_alias* node) {
-        const std::string* name = &node->name;
-        if (node->asname.size())
-            name = &node->asname;
-
-        _doSet(*name);
-        return true;
-    }
-    virtual bool visit_import(AST_Import* node) { return false; }
-    virtual bool visit_importfrom(AST_ImportFrom* node) { return false; }
-
-    virtual bool visit_assign(AST_Assign* node) {
-        for (int i = 0; i < node->targets.size(); i++) {
-            _doSet(node->targets[i]);
-        }
-        return true;
-    }
-
-    virtual bool visit_arguments(AST_arguments* node) {
-        if (node->kwarg.size())
-            _doSet(node->kwarg);
-        if (node->vararg.size())
-            _doSet(node->vararg);
-        for (int i = 0; i < node->args.size(); i++) {
-            _doSet(node->args[i]);
-        }
+    bool visit_loadname(BST_LoadName* node) override {
+        // don't visit the vreg it will never get killed
+        // visit_vreg(&node->vreg, false);
+        _doSet(node->vreg_dst);
         return true;
     }
 
@@ -342,137 +255,232 @@ public:
 };
 
 void DefinednessBBAnalyzer::processBB(Map& starting, CFGBlock* block) const {
-    DefinednessVisitor visitor(starting);
+    DefinednessVisitor visitor(code_constants, starting);
 
-    if (block == cfg->getStartingBlock() && arg_names.args) {
-        for (auto e : (*arg_names.args))
-            visitor._doSet(e);
-        if (arg_names.vararg->size())
-            visitor._doSet(*arg_names.vararg);
-        if (arg_names.kwarg->size())
-            visitor._doSet(*arg_names.kwarg);
+    for (BST_stmt* stmt : *block) {
+        stmt->accept(&visitor);
     }
 
-    for (int i = 0; i < block->body.size(); i++) {
-        block->body[i]->accept(&visitor);
-    }
-
-    if (VERBOSITY("analysis") >= 2) {
+    if (VERBOSITY("analysis") >= 3) {
         printf("At end of block %d:\n", block->idx);
         for (const auto& p : starting) {
-            printf("%s: %d\n", p.first.c_str(), p.second);
+            if (p.second != DefinednessAnalysis::Undefined)
+                printf("%s: %d\n", block->cfg->getVRegInfo().getName(p.first).c_str(), p.second);
         }
     }
 }
 
-DefinednessAnalysis::DefinednessAnalysis(const SourceInfo::ArgNames& arg_names, CFG* cfg, ScopeInfo* scope_info)
-    : scope_info(scope_info) {
+void DefinednessAnalysis::run(const CodeConstants& code_constants,
+                              VRegMap<DefinednessAnalysis::DefinitionLevel> initial_map, CFGBlock* initial_block) {
     Timer _t("DefinednessAnalysis()", 10);
 
-    results = computeFixedPoint(cfg, DefinednessBBAnalyzer(cfg, arg_names), false);
+    // Don't run this twice:
+    assert(!defined_at_end.size());
 
-    for (const auto& p : results) {
-        RequiredSet required;
-        for (const auto& p2 : p.second) {
-            if (scope_info->refersToGlobal(p2.first))
-                continue;
+    auto cfg = initial_block->cfg;
+    int nvregs = cfg->getVRegInfo().getTotalNumOfVRegs();
+    assert(initial_map.numVregs() == nvregs);
 
-            // printf("%d %s %d\n", p.first->idx, p2.first.c_str(), p2.second);
-            required.insert(p2.first);
+    auto&& vreg_info = cfg->getVRegInfo();
+    computeFixedPoint(std::move(initial_map), initial_block, DefinednessBBAnalyzer(code_constants), false,
+                      defined_at_beginning, defined_at_end);
+
+    for (const auto& p : defined_at_end) {
+        assert(p.second.numVregs() == nvregs);
+
+        assert(!defined_at_end_sets.count(p.first));
+        VRegSet& required = defined_at_end_sets.insert(std::make_pair(p.first, VRegSet(nvregs))).first->second;
+
+        // required.resize(nvregs, /* value= */ false);
+
+        for (int vreg = 0; vreg < nvregs; vreg++) {
+            auto status = p.second[vreg];
+            // assert(p.second.count(name));
+            // auto status = p.second.find(name)->second;
+            assert(status != DefinednessAnalysis::Unknown);
+            if (status != DefinednessAnalysis::Undefined)
+                required.set(vreg);
         }
-        defined_at_end.insert(make_pair(p.first, required));
     }
 
     static StatCounter us_definedness("us_compiling_analysis_definedness");
     us_definedness.log(_t.end());
 }
 
-DefinednessAnalysis::DefinitionLevel DefinednessAnalysis::isDefinedAtEnd(const std::string& name, CFGBlock* block) {
-    std::unordered_map<std::string, DefinitionLevel>& map = results[block];
-    if (map.count(name) == 0)
-        return Undefined;
-    return map[name];
+DefinednessAnalysis::DefinitionLevel DefinednessAnalysis::isDefinedAtEnd(int vreg, CFGBlock* block) {
+    assert(defined_at_end.count(block));
+    auto&& map = defined_at_end.find(block)->second;
+    return map[vreg];
 }
 
-const DefinednessAnalysis::RequiredSet& DefinednessAnalysis::getDefinedNamesAtEnd(CFGBlock* block) {
-    return defined_at_end[block];
+const VRegSet& DefinednessAnalysis::getDefinedVregsAtEnd(CFGBlock* block) {
+    assert(defined_at_end_sets.count(block));
+    return defined_at_end_sets.find(block)->second;
 }
 
-PhiAnalysis::PhiAnalysis(const SourceInfo::ArgNames& arg_names, CFG* cfg, LivenessAnalysis* liveness,
-                         ScopeInfo* scope_info)
-    : definedness(arg_names, cfg, scope_info), liveness(liveness) {
+PhiAnalysis::PhiAnalysis(VRegMap<DefinednessAnalysis::DefinitionLevel> initial_map, CFGBlock* initial_block,
+                         bool initials_need_phis, LivenessAnalysis* liveness)
+    : definedness(), empty_set(initial_map.numVregs()), liveness(liveness) {
+    auto cfg = initial_block->cfg;
+    auto&& vreg_info = cfg->getVRegInfo();
+
+    // I think this should always be the case -- if we're going to generate phis for the initial block,
+    // then we should include the initial arguments as an extra entry point.
+    assert(initials_need_phis == (initial_block->predecessors.size() > 0));
+
+    int num_vregs = initial_map.numVregs();
+    assert(num_vregs == vreg_info.getTotalNumOfVRegs());
+
+    definedness.run(liveness->getCodeConstants(), std::move(initial_map), initial_block);
+
     Timer _t("PhiAnalysis()", 10);
 
-    for (CFGBlock* block : cfg->blocks) {
-        RequiredSet required;
+    for (const auto& p : definedness.defined_at_end) {
+        CFGBlock* block = p.first;
+        assert(!required_phis.count(block));
+        VRegSet& required = required_phis.insert(std::make_pair(block, VRegSet(num_vregs))).first->second;
 
-        if (block->predecessors.size() > 1) {
+        int npred = 0;
+        for (CFGBlock* pred : block->predecessors) {
+            if (definedness.defined_at_end.count(pred))
+                npred++;
+        }
+
+        if (npred > 1 || (initials_need_phis && block == initial_block)) {
             for (CFGBlock* pred : block->predecessors) {
-                const RequiredSet& defined = definedness.getDefinedNamesAtEnd(pred);
-                for (const auto& s : defined) {
-                    if (required.count(s) == 0 && liveness->isLiveAtEnd(s, pred)) {
-                        // printf("%d-%d %s\n", pred->idx, block->idx, s.c_str());
+                if (!definedness.defined_at_end.count(pred))
+                    continue;
 
-                        required.insert(s);
+                const VRegSet& defined = definedness.getDefinedVregsAtEnd(pred);
+                for (int vreg : defined) {
+                    if (!required[vreg] && liveness->isLiveAtEnd(vreg, pred)) {
+                        // printf("%d-%d %s\n", pred->idx, block->idx, vreg_info.getName(vreg).c_str());
+
+                        required.set(vreg);
                     }
                 }
             }
         }
 
-        required_phis.insert(make_pair(block, std::move(required)));
+        if (VERBOSITY() >= 3) {
+            printf("Phis required at end of %d:", block->idx);
+            for (auto vreg : required) {
+                printf(" %s", vreg_info.getName(vreg).c_str());
+            }
+            printf("\n");
+        }
     }
 
     static StatCounter us_phis("us_compiling_analysis_phis");
     us_phis.log(_t.end());
 }
 
-const PhiAnalysis::RequiredSet& PhiAnalysis::getAllRequiredAfter(CFGBlock* block) {
-    static RequiredSet empty;
-    if (block->successors.size() == 0)
-        return empty;
-    return required_phis[block->successors[0]];
+const VRegSet& PhiAnalysis::getAllRequiredAfter(CFGBlock* block) {
+    auto successors = block->successors();
+    if (successors.size() == 0)
+        return empty_set;
+    assert(required_phis.count(successors[0]));
+    return required_phis.find(successors[0])->second;
 }
 
-const PhiAnalysis::RequiredSet& PhiAnalysis::getAllRequiredFor(CFGBlock* block) {
-    return required_phis[block];
+const VRegSet& PhiAnalysis::getAllRequiredFor(CFGBlock* block) {
+    assert(required_phis.count(block));
+    return required_phis.find(block)->second;
 }
 
-bool PhiAnalysis::isRequired(const std::string& name, CFGBlock* block) {
-    assert(!startswith(name, "!"));
-    return required_phis[block].count(name) != 0;
+bool PhiAnalysis::isRequired(int vreg, CFGBlock* block) {
+    assert(vreg >= 0);
+    assert(required_phis.count(block));
+    return required_phis.find(block)->second[vreg];
 }
 
-bool PhiAnalysis::isRequiredAfter(const std::string& name, CFGBlock* block) {
-    assert(!startswith(name, "!"));
+bool PhiAnalysis::isRequiredAfter(int vreg, CFGBlock* block) {
+    auto successors = block->successors();
+    assert(vreg >= 0);
     // If there are multiple successors, then none of them are allowed
     // to require any phi nodes
-    if (block->successors.size() != 1)
+    if (successors.size() != 1)
         return false;
 
     // Fall back to the other method:
-    return isRequired(name, block->successors[0]);
+    return isRequired(vreg, successors[0]);
 }
 
-bool PhiAnalysis::isPotentiallyUndefinedAfter(const std::string& name, CFGBlock* block) {
-    assert(!startswith(name, "!"));
-
-    if (block->successors.size() != 1)
-        return false;
-
-    for (CFGBlock* pred : block->successors[0]->predecessors) {
-        DefinednessAnalysis::DefinitionLevel dlevel = definedness.isDefinedAtEnd(name, pred);
-        if (dlevel != DefinednessAnalysis::Defined)
+bool PhiAnalysis::isPotentiallyUndefinedAfter(int vreg, CFGBlock* block) {
+    assert(vreg >= 0);
+    for (auto b : block->successors()) {
+        if (isPotentiallyUndefinedAt(vreg, b))
             return true;
     }
     return false;
 }
 
-LivenessAnalysis* computeLivenessInfo(CFG* cfg) {
-    return new LivenessAnalysis(cfg);
+bool PhiAnalysis::isPotentiallyUndefinedAt(int vreg, CFGBlock* block) {
+    assert(vreg >= 0);
+    assert(definedness.defined_at_beginning.count(block));
+    return definedness.defined_at_beginning.find(block)->second[vreg] != DefinednessAnalysis::Defined;
 }
 
-PhiAnalysis* computeRequiredPhis(const SourceInfo::ArgNames& args, CFG* cfg, LivenessAnalysis* liveness,
-                                 ScopeInfo* scope_info) {
-    return new PhiAnalysis(args, cfg, liveness, scope_info);
+std::unique_ptr<LivenessAnalysis> computeLivenessInfo(CFG* cfg, const CodeConstants& code_constants) {
+    static StatCounter counter("num_liveness_analysis");
+    counter.log();
+
+    return std::unique_ptr<LivenessAnalysis>(new LivenessAnalysis(cfg, code_constants));
+}
+
+std::unique_ptr<PhiAnalysis> computeRequiredPhis(const ParamNames& args, CFG* cfg, LivenessAnalysis* liveness) {
+    static StatCounter counter("num_phi_analysis");
+    counter.log();
+
+    auto&& vreg_info = cfg->getVRegInfo();
+    int num_vregs = vreg_info.getTotalNumOfVRegs();
+
+    VRegMap<DefinednessAnalysis::DefinitionLevel> initial_map(num_vregs);
+
+    assert(vreg_info.hasVRegsAssigned());
+    for (int vreg = 0; vreg < num_vregs; vreg++) {
+        initial_map[vreg] = DefinednessAnalysis::Undefined;
+    }
+
+    for (BST_Name* n : args.allArgsAsName()) {
+        ScopeInfo::VarScopeType vst = n->lookup_type;
+        assert(vst != ScopeInfo::VarScopeType::UNKNOWN);
+        assert(vst != ScopeInfo::VarScopeType::GLOBAL); // global-and-local error
+        if (vst == ScopeInfo::VarScopeType::NAME)
+            continue;
+        assert(n->vreg >= 0);
+        initial_map[n->vreg] = DefinednessAnalysis::Defined;
+    }
+
+    assert(initial_map.numVregs() == vreg_info.getTotalNumOfVRegs());
+
+    return std::unique_ptr<PhiAnalysis>(
+        new PhiAnalysis(std::move(initial_map), cfg->getStartingBlock(), false, liveness));
+}
+
+std::unique_ptr<PhiAnalysis> computeRequiredPhis(const OSREntryDescriptor* entry_descriptor,
+                                                 LivenessAnalysis* liveness) {
+    static StatCounter counter("num_phi_analysis");
+    counter.log();
+
+    auto cfg = entry_descriptor->code->source->cfg;
+    int num_vregs = cfg->getVRegInfo().getTotalNumOfVRegs();
+    VRegMap<DefinednessAnalysis::DefinitionLevel> initial_map(num_vregs);
+
+    for (int vreg = 0; vreg < num_vregs; vreg++) {
+        initial_map[vreg] = DefinednessAnalysis::Undefined;
+    }
+
+    for (const auto& p : entry_descriptor->args) {
+        int vreg = p.first;
+        ASSERT(initial_map[vreg] == DefinednessAnalysis::Undefined, "%d %d", vreg, initial_map[vreg]);
+        if (entry_descriptor->potentially_undefined[vreg])
+            initial_map[vreg] = DefinednessAnalysis::PotentiallyDefined;
+        else
+            initial_map[vreg] = DefinednessAnalysis::Defined;
+    }
+
+    return std::unique_ptr<PhiAnalysis>(
+        new PhiAnalysis(std::move(initial_map), entry_descriptor->backedge->target, true, liveness));
 }
 }

@@ -1,3 +1,9 @@
+# Some parsing tests:
+print ((1, 2),)
+print (1, 2, 3)
+print (1,2,)
+print (1,)
+
 t = (1, "h")
 print t, str(t), repr(t)
 if 1:
@@ -20,6 +26,8 @@ print t
 print (2,) < (2,)
 print (2,) < (2, 3)
 print (3,) < (2, 3)
+
+print () is (), () is tuple(), tuple() is tuple()
 
 print
 
@@ -71,11 +79,26 @@ t((T(1),), (T(2),1))
 
 print ("hello", "world", ["test"])
 
+class MyTuple(tuple):
+    pass
+mt = MyTuple((1, 2))
+print mt < (1, 2)
+print (1, 2) < mt
+print mt[1]
+print mt + (1,)
+print list(mt)
+print len(mt)
+
 # __add__
 print () + ()
 print (1, 2, 3) + ()
 print () + (1, 2, 3)
 print (1, 2) + (2, 3)
+
+try:
+    (1, 2) + "a"
+except TypeError as e:
+    print "adding failed"
 
 ## __new__
 print tuple()
@@ -123,6 +146,7 @@ except TypeError, e:
 t = (1, "2")
 print t[0]
 print t[1]
+print t[1L]
 
 t = (1, 2, 'a', 'b', 'c')
 print t[::-1]
@@ -177,3 +201,65 @@ print bool((0,))
 print bool((0, 0))
 
 print (65, (1, 2, 3), 65)
+
+# Multiplying a tuple by an integer
+x = (1, 2, 3)
+print x * -1
+print x * 0
+print x * 1
+print x * 5
+print -1 * x
+print 0 * x
+print 1 * x
+print 5 * x
+
+x = ()
+print x * -1
+print x * 0
+print x * 1
+print x * 5
+print -1 * x
+print 0 * x
+print 1 * x
+print 5 * x
+
+print (1, 3, 5, 3).index(3)
+try:
+    print (1, 3, 5, 3).index(2)
+except ValueError as e:
+    print e
+
+n = float('nan')
+print n in (n, n)
+
+#recursive printing test
+class C(object):
+    def __init__(self):
+        self.t = (self,)
+    def __repr__(self):
+        return repr(self.t)
+print repr(C())
+
+try:
+    (1, 2) + "a"
+except TypeError as e:
+    print(type(e))
+
+class D(object):
+    def __rmul__(self, other):
+        return other * 2
+
+d = D()
+
+try:
+    print((1, 2) * 3.5)
+except TypeError as e:
+    print(type(e))
+
+try:
+    print((1, 2) * d)
+except TypeError as e:
+    print(e.message)
+
+# this triggers a tuple resize because generators have a unknown len:
+print len(tuple(v*10 for v in range(100)))

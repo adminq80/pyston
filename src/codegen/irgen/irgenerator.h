@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,12 @@
 
 #include <map>
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/IR/Instructions.h"
 
+#include "core/cfg.h"
+#include "core/stringpool.h"
 #include "core/types.h"
 
 namespace llvm {
@@ -37,174 +40,169 @@ class GCBuilder;
 struct PatchpointInfo;
 class ScopeInfo;
 class TypeAnalysis;
+class RefcountTracker;
+class UnwindInfo;
 
-typedef std::unordered_map<std::string, CompilerVariable*> SymbolTable;
-typedef std::map<std::string, CompilerVariable*> SortedSymbolTable;
-typedef std::unordered_map<std::string, ConcreteCompilerVariable*> ConcreteSymbolTable;
+typedef VRegMap<CompilerVariable*> SymbolTable;
+typedef VRegMap<llvm::Value*> DefinednessTable;
+typedef VRegMap<ConcreteCompilerVariable*> ConcreteSymbolTable;
 
 extern const std::string CREATED_CLOSURE_NAME;
 extern const std::string PASSED_CLOSURE_NAME;
 extern const std::string PASSED_GENERATOR_NAME;
+extern const std::string FRAME_INFO_PTR_NAME;
+
 
 // Class that holds state of the current IR generation, that might not be local
 // to the specific phase or pass we're in.
 // TODO this probably shouldn't be here
 class IRGenState {
 private:
+    // Note: due to some not-yet-fixed behavior, cf->code_obj is NULL will only get set to point
+    // to code_obj at the end of irgen.
+    BoxedCode* code;
     CompiledFunction* cf;
+    llvm::Function* func;
     SourceInfo* source_info;
+    std::unique_ptr<PhiAnalysis> phis;
+    const ParamNames* param_names;
     GCBuilder* gc;
     llvm::MDNode* func_dbg_info;
+    RefcountTracker* refcount_tracker;
 
     llvm::AllocaInst* scratch_space;
+    llvm::Value* frame_info;
+    llvm::Value* boxed_locals;
+    llvm::Value* globals;
+    llvm::Value* vregs;
+    llvm::Value* stmt;
+
+    llvm::Value* passed_closure = NULL, * created_closure = NULL, * passed_generator = NULL;
+
     int scratch_size;
 
 public:
-    IRGenState(CompiledFunction* cf, SourceInfo* source_info, GCBuilder* gc, llvm::MDNode* func_dbg_info)
-        : cf(cf), source_info(source_info), gc(gc), func_dbg_info(func_dbg_info), scratch_space(NULL), scratch_size(0) {
-        assert(cf->func);
-        assert(!cf->clfunc); // in this case don't need to pass in sourceinfo
-    }
+    IRGenState(BoxedCode* code, CompiledFunction* cf, llvm::Function* func, SourceInfo* source_info,
+               std::unique_ptr<PhiAnalysis> phis, const ParamNames* param_names, GCBuilder* gc,
+               llvm::MDNode* func_dbg_info, RefcountTracker* refcount_tracker);
+    ~IRGenState();
+
+    CFG* getCFG() { return getSourceInfo()->cfg; }
 
     CompiledFunction* getCurFunction() { return cf; }
+    BoxedCode* getCode() { return code; }
+    const CodeConstants& getCodeConstants();
 
-    llvm::Function* getLLVMFunction() { return cf->func; }
+    ExceptionStyle getExceptionStyle() { return cf->exception_style; }
 
-    EffortLevel::EffortLevel getEffortLevel() { return cf->effort; }
+    llvm::Function* getLLVMFunction() { return func; }
+
+    EffortLevel getEffortLevel() { return cf->effort; }
 
     GCBuilder* getGC() { return gc; }
 
-    llvm::Value* getScratchSpace(int min_bytes);
+    void setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* passed_globals,
+                           llvm::Value* frame_info_arg = NULL);
+    void setupFrameInfoVarOSR(llvm::Value* frame_info_arg) { return setupFrameInfoVar(NULL, NULL, frame_info_arg); }
 
-    ConcreteCompilerType* getReturnType() {
-        assert(cf->spec);
-        return cf->spec->rtn_type;
-    }
+    llvm::Value* getScratchSpace(int min_bytes);
+    llvm::Value* getFrameInfoVar();
+    llvm::Value* getBoxedLocalsVar();
+    llvm::Value* getVRegsVar();
+    llvm::Value* getStmtVar();
+
+    ConcreteCompilerType* getReturnType() { return cf->getReturnType(); }
 
     SourceInfo* getSourceInfo() { return source_info; }
 
-    ScopeInfo* getScopeInfo();
-    ScopeInfo* getScopeInfoForNode(AST* node);
+    LivenessAnalysis* getLiveness() { return source_info->getLiveness(getCodeConstants()); }
+    PhiAnalysis* getPhis() { return phis.get(); }
+
+    const ScopingResults& getScopeInfo();
 
     llvm::MDNode* getFuncDbgInfo() { return func_dbg_info; }
+
+    RefcountTracker* getRefcounts() { return refcount_tracker; }
+
+    const ParamNames* getParamNames() { return param_names; }
+
+    llvm::Value* getPassedClosure();
+    llvm::Value* getCreatedClosure();
+    llvm::Value* getPassedGenerator();
+
+    void setPassedClosure(llvm::Value*);
+    void setCreatedClosure(llvm::Value*);
+    void setPassedGenerator(llvm::Value*);
+
+    // Returns the custom globals, or the module if the globals come from the module.
+    llvm::Value* getGlobals();
+    // Returns the custom globals, or null if the globals come from the module.
+    llvm::Value* getGlobalsIfCustom();
 };
 
-class GuardList {
-public:
-    struct ExprTypeGuard {
-        CFGBlock* cfg_block;
-        llvm::BranchInst* branch;
-        AST_expr* ast_node;
-        CompilerVariable* val;
-        SymbolTable st;
-
-        ExprTypeGuard(CFGBlock* cfg_block, llvm::BranchInst* branch, AST_expr* ast_node, CompilerVariable* val,
-                      const SymbolTable& st);
-    };
-
-    struct BlockEntryGuard {
-        CFGBlock* cfg_block;
-        llvm::BranchInst* branch;
-        SymbolTable symbol_table;
-
-        BlockEntryGuard(CFGBlock* cfg_block, llvm::BranchInst* branch, const SymbolTable& symbol_table);
-    };
-
-private:
-    std::unordered_map<AST_expr*, ExprTypeGuard*> expr_type_guards;
-    std::unordered_map<CFGBlock*, std::vector<BlockEntryGuard*> > block_begin_guards;
-    // typedef std::unordered_map<AST_expr*, ExprTypeGuard*>::iterator expr_type_guard_iterator;
-    // typedef std::unordered_map<AST_expr*, ExprTypeGuard*>::const_iterator expr_type_guard_const_iterator;
-    typedef decltype(expr_type_guards)::iterator expr_type_guard_iterator;
-    typedef decltype(expr_type_guards)::const_iterator expr_type_guard_const_iterator;
-
-public:
-    llvm::iterator_range<expr_type_guard_iterator> exprGuards() {
-        return llvm::iterator_range<expr_type_guard_iterator>(expr_type_guards.begin(), expr_type_guards.end());
-    }
-
-    void getBlocksWithGuards(std::unordered_set<CFGBlock*>& add_to) {
-        for (const auto& p : block_begin_guards) {
-            add_to.insert(p.first);
-        }
-    }
-
-    void assertGotPatched() {
-#ifndef NDEBUG
-        for (const auto& p : block_begin_guards) {
-            for (const auto g : p.second) {
-                assert(g->branch->getSuccessor(0) != g->branch->getSuccessor(1));
-            }
-        }
-
-        for (const auto& p : expr_type_guards) {
-            assert(p.second->branch->getSuccessor(0) != p.second->branch->getSuccessor(1));
-        }
-#endif
-    }
-
-    ExprTypeGuard* getNodeTypeGuard(AST_expr* node) const {
-        expr_type_guard_const_iterator it = expr_type_guards.find(node);
-        if (it == expr_type_guards.end())
-            return NULL;
-        return it->second;
-    }
-
-    bool isEmpty() const { return expr_type_guards.size() == 0 && block_begin_guards.size() == 0; }
-
-    void addExprTypeGuard(CFGBlock* cfg_block, llvm::BranchInst* branch, AST_expr* ast_node, CompilerVariable* val,
-                          const SymbolTable& st) {
-        ExprTypeGuard*& g = expr_type_guards[ast_node];
-        assert(g == NULL);
-        g = new ExprTypeGuard(cfg_block, branch, ast_node, val, st);
-    }
-
-    void registerGuardForBlockEntry(CFGBlock* cfg_block, llvm::BranchInst* branch, const SymbolTable& st) {
-        // printf("Adding guard for block %p, in %p\n", cfg_block, this);
-        std::vector<BlockEntryGuard*>& v = block_begin_guards[cfg_block];
-        v.push_back(new BlockEntryGuard(cfg_block, branch, st));
-    }
-
-    const std::vector<BlockEntryGuard*>& getGuardsForBlock(CFGBlock* block) const {
-        std::unordered_map<CFGBlock*, std::vector<BlockEntryGuard*> >::const_iterator it
-            = block_begin_guards.find(block);
-        if (it != block_begin_guards.end())
-            return it->second;
-
-        static std::vector<BlockEntryGuard*> empty_list;
-        return empty_list;
-    }
-};
-
+// turns CFGBlocks into LLVM IR
 class IRGenerator {
 private:
 public:
+    struct ExceptionState {
+        llvm::BasicBlock* from_block;
+        ConcreteCompilerVariable* exc_type, *exc_value, *exc_tb;
+        ExceptionState(llvm::BasicBlock* from_block, ConcreteCompilerVariable* exc_type,
+                       ConcreteCompilerVariable* exc_value, ConcreteCompilerVariable* exc_tb)
+            : from_block(from_block), exc_type(exc_type), exc_value(exc_value), exc_tb(exc_tb) {}
+    };
     struct EndingState {
+        // symbol_table records which Python variables are bound to what CompilerVariables at the end of this block.
+        // phi_symbol_table records the ones that will need to be `phi'd.
+        // both only record non-globals.
+
+        // TODO: switch these to unique_ptr's
         SymbolTable* symbol_table;
         ConcreteSymbolTable* phi_symbol_table;
+        DefinednessTable* definedness_vars;
         llvm::BasicBlock* ending_block;
-        EndingState(SymbolTable* symbol_table, ConcreteSymbolTable* phi_symbol_table, llvm::BasicBlock* ending_block)
-            : symbol_table(symbol_table), phi_symbol_table(phi_symbol_table), ending_block(ending_block) {}
+        llvm::SmallVector<ExceptionState, 2> exception_state;
+
+        EndingState(SymbolTable* symbol_table, ConcreteSymbolTable* phi_symbol_table,
+                    DefinednessTable* definedness_vars, llvm::BasicBlock* ending_block,
+                    llvm::ArrayRef<ExceptionState> exception_state)
+            : symbol_table(symbol_table),
+              phi_symbol_table(phi_symbol_table),
+              definedness_vars(definedness_vars),
+              ending_block(ending_block),
+              exception_state(exception_state.begin(), exception_state.end()) {}
     };
 
     virtual ~IRGenerator() {}
 
-    virtual void doFunctionEntry(const SourceInfo::ArgNames& arg_names,
-                                 const std::vector<ConcreteCompilerType*>& arg_types) = 0;
+    virtual void doFunctionEntry(const ParamNames& param_names, const std::vector<ConcreteCompilerType*>& arg_types)
+        = 0;
 
-    virtual void giveLocalSymbol(const std::string& name, CompilerVariable* var) = 0;
+#ifndef NDEBUG
+    virtual void giveLocalSymbol(InternedString name, CompilerVariable* var) = 0;
+#endif
+    virtual void giveLocalSymbol(int vreg, CompilerVariable* var) = 0;
+    virtual void giveDefinednessVar(int vreg, llvm::Value* val) = 0;
     virtual void copySymbolsFrom(SymbolTable* st) = 0;
-    virtual void run(const CFGBlock* block) = 0;
+    virtual void run(const CFGBlock* block) = 0; // primary entry point
     virtual EndingState getEndingSymbolTable() = 0;
-    virtual void doSafePoint() = 0;
+    virtual void doSafePoint(BST_stmt* next_statement) = 0;
     virtual void addFrameStackmapArgs(PatchpointInfo* pp, std::vector<llvm::Value*>& stackmap_args) = 0;
+    virtual void addOutgoingExceptionState(ExceptionState exception_state) = 0;
+    virtual void setIncomingExceptionState(llvm::SmallVector<ExceptionState, 2> exc_state) = 0;
+    virtual llvm::BasicBlock* getCXXExcDest(const UnwindInfo&) = 0;
+    virtual llvm::BasicBlock* getCAPIExcDest(llvm::BasicBlock* from_block, llvm::BasicBlock* final_dest,
+                                             BST_stmt* current_stmt, bool is_after_deopt = false) = 0;
+    virtual CFGBlock* getCFGBlock() = 0;
 };
 
+std::tuple<llvm::Value*, llvm::Value*, llvm::Value*> createLandingpad(llvm::BasicBlock*);
+
 class IREmitter;
+class BST_Call;
 IREmitter* createIREmitter(IRGenState* irstate, llvm::BasicBlock*& curblock, IRGenerator* irgenerator = NULL);
 IRGenerator* createIRGenerator(IRGenState* irstate, std::unordered_map<CFGBlock*, llvm::BasicBlock*>& entry_blocks,
-                               CFGBlock* myblock, TypeAnalysis* types, GuardList& out_guards,
-                               const GuardList& in_guards, bool is_partial);
+                               CFGBlock* myblock, TypeAnalysis* types);
 }
 
 #endif

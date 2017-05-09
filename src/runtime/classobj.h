@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,14 +19,25 @@
 
 namespace pyston {
 
+/*
+ * Class objects refer to Python's old-style classes that don't inherit from
+ * `object`. This, classes declared as:
+ *
+ * class Foo:
+ *  ...
+ *
+ * When debugging, "obj->cls->tp_name" will have value "instance" for all
+ * old-style classes rather than the name of the class itself.
+ */
+
 void setupClassobj();
 
 class BoxedClass;
 class BoxedClassobj;
 class BoxedInstance;
+extern "C" {
 extern BoxedClass* classobj_cls, *instance_cls;
-
-bool instanceIsinstance(BoxedInstance* obj, BoxedClassobj* cls);
+}
 
 class BoxedClassobj : public Box {
 public:
@@ -35,15 +46,16 @@ public:
     BoxedTuple* bases;
     BoxedString* name;
 
-    BoxedClassobj(BoxedClass* metaclass, BoxedString* name, BoxedTuple* bases)
-        : Box(metaclass), bases(bases), name(name) {}
+    Box** weakreflist;
 
-    static void gcHandler(GCVisitor* v, Box* _o) {
-        assert(_o->cls == classobj_cls);
-        BoxedClassobj* o = static_cast<BoxedClassobj*>(_o);
-
-        boxGCHandler(v, o);
+    BoxedClassobj(BoxedString* name, BoxedTuple* bases) : bases(bases), name(name) {
+        Py_INCREF(name);
+        Py_INCREF(bases);
     }
+
+    static void dealloc(Box* b) noexcept;
+    static int traverse(Box* self, visitproc visit, void* arg) noexcept;
+    static int clear(Box* self) noexcept;
 };
 
 class BoxedInstance : public Box {
@@ -52,15 +64,23 @@ public:
 
     BoxedClassobj* inst_cls;
 
-    BoxedInstance(BoxedClassobj* inst_cls) : Box(instance_cls), inst_cls(inst_cls) {}
+    Box** weakreflist;
 
-    static void gcHandler(GCVisitor* v, Box* _o) {
-        assert(_o->cls == instance_cls);
-        BoxedInstance* o = static_cast<BoxedInstance*>(_o);
+    BoxedInstance(BoxedClassobj* inst_cls) : inst_cls(inst_cls) { Py_INCREF(inst_cls); }
 
-        boxGCHandler(v, o);
-    }
+    DEFAULT_CLASS(instance_cls);
+
+    static void dealloc(Box* b) noexcept;
+    static int traverse(Box* self, visitproc visit, void* arg) noexcept;
+    static int clear(Box* self) noexcept;
 };
+
+Box* instance_getattro(Box* cls, Box* attr) noexcept;
+int instance_setattro(Box* cls, Box* attr, Box* value) noexcept;
+class GetattrRewriteArgs;
+template <ExceptionStyle S>
+Box* instanceGetattroInternal(Box* self, Box* attr, GetattrRewriteArgs* rewrite_args) noexcept(S == CAPI);
+void instanceSetattroInternal(Box* self, STOLEN(Box*) attr, Box* val, SetattrRewriteArgs* rewrite_args);
 }
 
 #endif

@@ -1,11 +1,11 @@
-# Copyright (c) 2014 Dropbox, Inc.
-# 
+# Copyright (c) 2014-2016 Dropbox, Inc.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #    http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,15 +14,16 @@
 
 #!/usr/bin/env python
 
+import Queue
+import argparse
 import cPickle
 import datetime
 import functools
-import getopt
 import glob
 import os
-import Queue
 import re
 import resource
+import shutil
 import signal
 import subprocess
 import sys
@@ -35,7 +36,21 @@ IMAGE = "pyston_dbg"
 KEEP_GOING = False
 FN_JUST_SIZE = 20
 EXTRA_JIT_ARGS = []
-TIME_LIMIT = 6
+TIME_LIMIT = 25
+TESTS_TO_SKIP = []
+EXIT_CODE_ONLY = False
+SKIP_FAILING_TESTS = False
+VERBOSE = 1
+
+DISPLAY_SKIPS = False
+DISPLAY_SUCCESSES = True
+
+def success_message(msg):
+    if DISPLAY_SUCCESSES:
+        return msg
+    return ""
+
+PYTHONIOENCODING = 'utf-8'
 
 # For fun, can test pypy.
 # Tough because the tester will check to see if the error messages are exactly the
@@ -52,6 +67,27 @@ def set_ulimits():
     MAX_MEM_MB = 100
     resource.setrlimit(resource.RLIMIT_RSS, (MAX_MEM_MB * 1024 * 1024, MAX_MEM_MB * 1024 * 1024))
 
+EXTMODULE_DIR = None
+EXTMODULE_DIR_PYSTON = None
+THIS_FILE = os.path.abspath(__file__)
+
+_global_mtime = None
+def get_global_mtime():
+    global _global_mtime
+    if _global_mtime is not None:
+        return _global_mtime
+
+    # Start off by depending on the tester itself
+    rtn = os.stat(THIS_FILE).st_mtime
+
+    assert os.listdir(EXTMODULE_DIR), EXTMODULE_DIR
+    for fn in os.listdir(EXTMODULE_DIR):
+        if not fn.endswith(".so"):
+            continue
+        rtn = max(rtn, os.stat(os.path.join(EXTMODULE_DIR, fn)).st_mtime)
+    _global_mtime = rtn
+    return rtn
+
 def get_expected_output(fn):
     sys.stdout.flush()
     assert fn.endswith(".py")
@@ -61,15 +97,17 @@ def get_expected_output(fn):
 
     cache_fn = fn[:-3] + ".expected_cache"
     if os.path.exists(cache_fn):
-        if os.stat(cache_fn).st_mtime > os.stat(fn).st_mtime:
+        cache_mtime = os.stat(cache_fn).st_mtime
+        if cache_mtime > os.stat(fn).st_mtime and cache_mtime > get_global_mtime():
             try:
                 return cPickle.load(open(cache_fn))
-            except EOFError:
+            except (EOFError, ValueError):
                 pass
 
     # TODO don't suppress warnings globally:
     env = dict(os.environ)
-    env["PYTHONPATH"] = "../test/test_extension/build/lib.linux-x86_64-2.7/"
+    env["PYTHONPATH"] = EXTMODULE_DIR
+    env["PYTHONIOENCODING"] = PYTHONIOENCODING
     p = subprocess.Popen(["python", "-Wignore", fn], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=open("/dev/null"), preexec_fn=set_ulimits, env=env)
     out, err = p.communicate()
     code = p.wait()
@@ -94,6 +132,10 @@ def canonicalize_stderr(stderr):
     substitutions = [
             ("NameError: global name '", "NameError: name '"),
             ("AttributeError: '(\w+)' object attribute '(\w+)' is read-only", "AttributeError: \\2"),
+            (r"TypeError: object.__new__\(\) takes no parameters", "TypeError: object() takes no parameters"),
+            ("IndexError: list assignment index out of range", "IndexError: list index out of range"),
+            (r"unqualified exec is not allowed in function '(\w+)' it (.*)",
+             r"unqualified exec is not allowed in function '\1' because it \2"),
             ]
 
     for pattern, subst_with in substitutions:
@@ -102,76 +144,169 @@ def canonicalize_stderr(stderr):
     return stderr
 
 failed = []
-def run_test(fn, check_stats, run_memcheck):
-    r = fn.rjust(FN_JUST_SIZE)
 
-    statchecks = []
-    jit_args = ["-csrq"] + EXTRA_JIT_ARGS
-    expected = "success"
-    allow_warnings = []
+class Options(object): pass
+
+# returns a single string, or a tuple of strings that are spliced together (with spaces between) by our caller
+def run_test(fn, check_stats, run_memcheck):
+    opts = get_test_options(fn, check_stats, run_memcheck)
+    del check_stats, run_memcheck
+
+    if opts.skip:
+        return ("(skipped: %s)" % opts.skip) if DISPLAY_SKIPS else ""
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = EXTMODULE_DIR_PYSTON
+    env["PYTHONIOENCODING"] = PYTHONIOENCODING
+    run_args = [os.path.abspath(IMAGE)] + opts.jit_args + [fn]
+    start = time.time()
+    p = subprocess.Popen(run_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=open("/dev/null"),
+                         preexec_fn=set_ulimits, env=env)
+    out, stderr = p.communicate()
+    code = p.wait()
+    elapsed = time.time() - start
+
+    if code >= 128:
+        code -= 256
+
+    return determine_test_result(fn, opts, code, out, stderr, elapsed)
+
+def get_test_options(fn, check_stats, run_memcheck):
+    opts = Options()
+
+    opts.check_stats = check_stats
+    opts.run_memcheck = run_memcheck
+    opts.statchecks = []
+    opts.jit_args = ["-rq"] + EXTRA_JIT_ARGS
+    opts.collect_stats = True
+    opts.expected = "success"
+    opts.should_error = False
+    opts.allow_warnings = []
+    opts.skip = None
+
     for l in open(fn):
         l = l.strip()
         if not l:
             continue
+        if l.startswith("\xef\xbb\xbf"): # BOM
+            l = l[3:]
         if not l.startswith("#"):
             break
         if l.startswith("# statcheck:"):
             l = l[len("# statcheck:"):].strip()
-            statchecks.append(l)
+            opts.statchecks.append(l)
         elif l.startswith("# run_args:"):
             l = l[len("# run_args:"):].split()
-            jit_args += l
+            opts.jit_args += l
         elif l.startswith("# expected:"):
-            expected = l[len("# expected:"):].strip()
+            assert opts.expected == "success", "Multiple 'expected:' lines found!"
+            opts.expected = l[len("# expected:"):].strip()
+            assert opts.expected != "success", "'expected: success' is the default and is ignored"
+        elif l.startswith("# should_error"):
+            opts.should_error = True
         elif l.startswith("# fail-if:"):
             condition = l.split(':', 1)[1].strip()
             if eval(condition):
-                expected = "fail"
+                opts.expected = "fail"
         elif l.startswith("# skip-if:"):
             skip_if = l[len("# skip-if:"):].strip()
-            skip = eval(skip_if)
-            if skip:
-                return r + "    (skipped due to 'skip-if: %s')" % skip_if[:30]
+            if eval(skip_if):
+                opts.skip = "skip-if: %s" % skip_if[:30]
         elif l.startswith("# allow-warning:"):
-            allow_warnings.append("Warning: " + l.split(':', 1)[1].strip())
+            opts.allow_warnings.append("Warning: " + l.split(':', 1)[1].strip())
+        elif l.startswith("# no-collect-stats"):
+            opts.collect_stats = False
 
-    assert expected in ("success", "fail", "statfail"), expected
+    if not opts.skip:
+        # consider other reasons for skipping file
+        if SKIP_FAILING_TESTS and opts.expected == 'fail':
+            opts.skip = 'expected to fail'
+        elif os.path.basename(fn).split('.')[0] in TESTS_TO_SKIP:
+            opts.skip = 'command line option'
+
+    assert opts.expected in ("success", "fail", "statfail"), opts.expected
 
     if TEST_PYPY:
-        jit_args = []
-        check_stats = False
-        expected = "success"
+        opts.jit_args = []
+        opts.collect_stats = False
+        opts.check_stats = False
+        opts.expected = "success"
 
-    run_args = [os.path.abspath(IMAGE)] + jit_args + [fn]
-    start = time.time()
-    p = subprocess.Popen(run_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=open("/dev/null"), preexec_fn=set_ulimits)
-    out, stderr = p.communicate()
-    last_stderr_line = stderr.strip().split('\n')[-1]
+    if opts.collect_stats:
+        opts.jit_args = ['-T'] + opts.jit_args
 
-    code = p.wait()
-    elapsed = time.time() - start
+    return opts
 
-    stats = {}
-    if allow_warnings:
+def diff_output(expected, received, expected_file_prefix, received_file_prefix):
+    exp_fd, exp_fn = tempfile.mkstemp(prefix=expected_file_prefix)
+    rec_fd, rec_fn = tempfile.mkstemp(prefix=received_file_prefix)
+    os.fdopen(exp_fd, 'w').write(expected)
+    os.fdopen(rec_fd, 'w').write(received)
+    p = subprocess.Popen(["diff", "--unified=5", "-a", exp_fn, rec_fn], stdout=subprocess.PIPE, preexec_fn=set_ulimits)
+    diff = p.stdout.read()
+    assert p.wait() in (0, 1)
+    os.unlink(exp_fn)
+    os.unlink(rec_fn)
+    return diff
+
+
+def determine_test_result(fn, opts, code, out, stderr, elapsed):
+    if opts.allow_warnings:
         out_lines = []
         for l in out.split('\n'):
-            for regex in allow_warnings:
-                if re.match(l, regex):
+            for regex in opts.allow_warnings:
+                if re.match(regex, l):
                     break
             else:
                 out_lines.append(l)
         out = "\n".join(out_lines)
-    if code == 0 and not TEST_PYPY:
-        assert out.count("Stats:") == 1
-        out, stats_str = out.split("Stats:")
-        for l in stats_str.strip().split('\n'):
-            k, v = l.split(':')
-            stats[k.strip()] = int(v)
 
-    expected_code, expected_out, expected_err = get_expected_output(fn)
+    stats = None
+    if opts.collect_stats:
+        stats = {}
+        have_stats = (stderr.count("Stats:") == 1 and stderr.count("(End of stats)") == 1)
+
+        if code >= 0:
+            if not have_stats:
+                color = 31
+                msg = "no stats available"
+                if opts.expected == "fail":
+                    return success_message("Expected failure (no stats found)")
+                elif KEEP_GOING:
+                    failed.append(fn)
+                    if VERBOSE >= 1:
+                        return "\033[%dmFAILED\033[0m (%s)\n%s" % (color, msg, stderr)
+                    else:
+                        return "\033[%dmFAILED\033[0m (%s)" % (color, msg)
+                else:
+                    raise Exception("%s\n%s" % (msg, stderr))
+            assert have_stats
+
+        if have_stats:
+            assert stderr.count("Stats:") == 1
+            stderr, stats_str = stderr.split("Stats:")
+            stats_str, stderr_tail = stats_str.split("(End of stats)\n")
+            stderr += stderr_tail
+
+            other_stats_str, counter_str = stats_str.split("Counters:")
+            for l in counter_str.strip().split('\n'):
+                assert l.count(':') == 1, l
+                k, v = l.split(':')
+                stats[k.strip()] = int(v)
+
+    last_stderr_line = stderr.strip().split('\n')[-1]
+
+    if EXIT_CODE_ONLY:
+        # fools the rest of this function into thinking the output is OK & just checking the exit code.
+        # there oughtta be a cleaner way to do this.
+        expected_code, expected_out, expected_err = 0, out, stderr
+    else:
+        # run CPython to get the expected output
+        expected_code, expected_out, expected_err = get_expected_output(fn)
+
+    color = 31 # red
+
     if code != expected_code:
-        color = 31 # red
-
         if code == 0:
             err = "(Unexpected success)"
         else:
@@ -185,87 +320,111 @@ def run_test(fn, check_stats, run_memcheck):
         else:
             msg = "Exited with code %d (expected code %d)" % (code, expected_code)
 
-        if expected == "fail":
-            r += "    Expected failure (got code %d, should be %d)" % (code, expected_code)
-            return r
-        else:
-            if KEEP_GOING:
-                r += "    \033[%dmFAILED\033[0m (%s)" % (color, msg)
-                failed.append(fn)
-                return r
-            else:
-                raise Exception("%s\n%s\n%s" % (msg, err, stderr))
-    elif out != expected_out:
-        if expected == "fail":
-            r += "    Expected failure (bad output)"
-            return r
-        else:
-            if KEEP_GOING:
-                r += "    \033[31mFAILED\033[0m (bad output)"
-                failed.append(fn)
-                return r
-            exp_fd, exp_fn = tempfile.mkstemp(prefix="expected_")
-            out_fd, out_fn = tempfile.mkstemp(prefix="received_")
-            os.fdopen(exp_fd, 'w').write(expected_out)
-            os.fdopen(out_fd, 'w').write(out)
-            p = subprocess.Popen(["diff", "-C2", "-a", exp_fn, out_fn], stdout=subprocess.PIPE, preexec_fn=set_ulimits)
-            diff = p.stdout.read()
-            assert p.wait() in (0, 1)
-            os.unlink(exp_fn)
-            os.unlink(out_fn)
-            raise Exception("Failed on %s:\n%s" % (fn, diff))
-    elif not TEST_PYPY and canonicalize_stderr(stderr) != canonicalize_stderr(expected_err):
-        if expected == "fail":
-            r += "    Expected failure (bad stderr)"
-            return r
+        if opts.expected == "fail":
+            return success_message("Expected failure (got code %d, should be %d)" % (code, expected_code))
         elif KEEP_GOING:
-            r += "    \033[31mFAILED\033[0m (bad stderr)"
             failed.append(fn)
-            return r
+            if VERBOSE >= 1:
+                return "\033[%dmFAILED\033[0m (%s)\n%s" % (color, msg, stderr)
+            else:
+                return "\033[%dmFAILED\033[0m (%s)" % (color, msg)
         else:
-            raise Exception((canonicalize_stderr(stderr), canonicalize_stderr(expected_err)))
-    elif expected == "fail":
+            raise Exception("%s\n%s\n%s" % (msg, err, stderr))
+
+    elif opts.should_error == (code == 0):
+        if code == 0:
+            msg = "Exited successfully; remove '# should_error' if this is expected"
+        else:
+            msg = "Exited with code %d; add '# should_error' if this is expected" % code
+
         if KEEP_GOING:
-            r += "    \033[31mFAILED\033[0m (unexpected success)"
             failed.append(fn)
-            return r
+            return "\033[%dmFAILED\033[0m (%s)" % (color, msg)
+        else:
+            # show last line of stderr so we have some idea went wrong
+            print "Last line of stderr: " + last_stderr_line
+            raise Exception(msg)
+
+    elif out != expected_out:
+        if opts.expected == "fail":
+            return success_message("Expected failure (bad output)")
+        else:
+            diff = diff_output(expected_out, out, "expected_", "received_")
+            if KEEP_GOING:
+                failed.append(fn)
+                if VERBOSE >= 1:
+                    return "\033[%dmFAILED\033[0m (bad output)\n%s" % (color, diff)
+                else:
+                    return "\033[%dmFAILED\033[0m (bad output)" % (color,)
+
+            else:
+                raise Exception("Failed on %s:\n%s" % (fn, diff))
+    elif not TEST_PYPY and canonicalize_stderr(stderr) != canonicalize_stderr(expected_err):
+        if opts.expected == "fail":
+            return success_message("Expected failure (bad stderr)")
+        else:
+            diff = diff_output(expected_err, stderr, "expectederr_", "receivederr_")
+            if KEEP_GOING:
+                failed.append(fn)
+                if VERBOSE >= 1:
+                    return "\033[%dmFAILED\033[0m (bad stderr)\n%s" % (color, diff)
+                else:
+                    return "\033[%dmFAILED\033[0m (bad stderr)" % (color,)
+            else:
+                raise Exception((canonicalize_stderr(stderr), canonicalize_stderr(expected_err)))
+    elif opts.expected == "fail":
+        if KEEP_GOING:
+            failed.append(fn)
+            return "\033[31mFAILED\033[0m (unexpected success)"
         raise Exception("Unexpected success on %s" % fn)
 
-    r += "    Correct output (%5.1fms)" % (elapsed * 1000,)
+    r = ("Correct output (%5.1fms)" % (elapsed * 1000,),)
 
-    if check_stats:
+    if opts.check_stats:
         def noninit_count(s):
-            return stats[s] - stats.get("_init_" + s, 0)
+            return stats.get(s, 0) - stats.get("_init_" + s, 0)
 
-        for l in statchecks:
+        for l in opts.statchecks:
             test = eval(l)
             if not test:
-                if expected == "statfail":
-                    r += "    (expected statfailure)"
+                if opts.expected == "statfail":
+                    r += ("(expected statfailure)",)
                     break
-                elif KEEP_GOING:
-                    r += "    \033[31mFailed statcheck\033[0m"
-                    failed.append(fn)
-                    return r
                 else:
+                    msg = ()
                     m = re.match("""stats\[['"]([\w_]+)['"]]""", l)
                     if m:
                         statname = m.group(1)
-                        raise Exception((l, statname, stats[statname]))
-                    raise Exception((l, stats))
+                        msg = (l, statname, stats[statname])
+
+                    m = re.search("""noninit_count\(['"]([\w_]+)['"]\)""", l)
+                    if m and not msg:
+                        statname = m.group(1)
+                        msg = (l, statname, noninit_count(statname))
+
+                    if not msg:
+                        msg = (l, stats)
+
+                    elif KEEP_GOING:
+                        failed.append(fn)
+                        if VERBOSE:
+                            return r + ("\033[31mFailed statcheck\033[0m\n%s" % (msg,),)
+                        else:
+                            return r + ("\033[31mFailed statcheck\033[0m",)
+                    else:
+                        raise Exception(msg)
         else:
             # only can get here if all statchecks passed
-            if expected == "statfail":
+            if opts.expected == "statfail":
                 if KEEP_GOING:
-                    r += "    \033[31mUnexpected statcheck success\033[0m"
                     failed.append(fn)
-                    return r
+                    return r + ("\033[31mUnexpected statcheck success\033[0m",)
                 else:
-                    raise Exception(("Unexpected statcheck success!", statchecks, stats))
+                    raise Exception(("Unexpected statcheck success!", opts.statchecks, stats))
     else:
-        r += "    (ignoring stats)"
+        r += ("(ignoring stats)",)
 
-    if run_memcheck:
+    if opts.run_memcheck:
         if code == 0:
             start = time.time()
             p = subprocess.Popen(["valgrind", "--tool=memcheck", "--leak-check=no"] + run_args, stdout=open("/dev/null", 'w'), stderr=subprocess.PIPE, stdin=open("/dev/null"))
@@ -273,18 +432,17 @@ def run_test(fn, check_stats, run_memcheck):
             assert p.wait() == 0
             if "Invalid read" not in err:
                 elapsed = (time.time() - start)
-                r += "    Memcheck passed (%4.1fs)" % (elapsed,)
+                r += ("Memcheck passed (%4.1fs)" % (elapsed,),)
             else:
                 if KEEP_GOING:
-                    r += "    \033[31mMEMCHECKS FAILED\033[0m"
                     failed.append(fn)
-                    return r
+                    return r + ("\033[31mMEMCHECKS FAILED\033[0m",)
                 else:
                     raise Exception(err)
         else:
-            r += "    (Skipping memchecks)   "
+            r += ("(Skipping memchecks)",)
 
-    return r
+    return success_message(r)
 
 q = Queue.Queue()
 cv = threading.Condition()
@@ -303,8 +461,8 @@ def worker_thread():
         except:
             import traceback
             # traceback.print_exc()
-            results[job[0]] = None
             quit[job[0]] = job[0] + ':\n' + traceback.format_exc()
+            results[job[0]] = None
             with cv:
                 cv.notifyAll()
             # os._exit(-1)
@@ -313,94 +471,130 @@ def fileSize(fn):
     return os.stat(fn).st_size
     # return len(list(open(fn)))
 
-if __name__ == "__main__":
+# our arguments
+parser = argparse.ArgumentParser(description='Runs Pyston tests.')
+parser.add_argument('-m', '--run-memcheck', action='store_true', help='run memcheck')
+parser.add_argument('-j', '--num-threads', metavar='N', type=int, default=NUM_THREADS,
+                    help='number of threads')
+parser.add_argument('-k', '--keep-going', default=KEEP_GOING, action='store_true',
+                    help='keep going after test failure')
+parser.add_argument('-R', '--image', default=IMAGE,
+                    help='the executable to test (default: %s)' % IMAGE)
+parser.add_argument('-K', '--no-keep-going', dest='keep_going', action='store_false',
+                    help='quit after test failure')
+parser.add_argument('-a', '--extra-args', default=[], action='append',
+                    help="additional arguments to pyston (must be invoked with equal sign: -a=-ARG)")
+parser.add_argument('-t', '--time-limit', type=int, default=TIME_LIMIT,
+                    help='set time limit in seconds for each test')
+parser.add_argument('-s', '--skip-tests', type=str, default='',
+                    help='tests to skip (comma-separated)')
+parser.add_argument('-e', '--exit-code-only', action='store_true',
+                    help="only check exit code; don't run CPython to get expected output to compare against")
+parser.add_argument('-q', '--quiet', action='store_true',
+                    help="Only display failing tests")
+parser.add_argument('--skip-failing', action='store_true',
+                    help="skip tests expected to fail")
+parser.add_argument('--order-by-mtime', action='store_true',
+                    help="order test execution by modification time, instead of file size")
+
+parser.add_argument('test_dir')
+parser.add_argument('pattern', nargs='*')
+
+def main(orig_dir):
+    global KEEP_GOING
+    global IMAGE
+    global EXTRA_JIT_ARGS
+    global TIME_LIMIT
+    global TEST_DIR
+    global FN_JUST_SIZE
+    global TESTS_TO_SKIP
+    global EXIT_CODE_ONLY
+    global SKIP_FAILING_TESTS
+    global VERBOSE
+    global EXTMODULE_DIR_PYSTON
+    global EXTMODULE_DIR
+    global DISPLAY_SUCCESSES
+    global IS_OPTIMIZED
+
     run_memcheck = False
-    start = 1
 
-    opts, patterns = getopt.gnu_getopt(sys.argv[1:], "j:a:t:mR:k")
-    for (t, v) in opts:
-        if t == '-m':
-            run_memcheck = True
-        elif t == '-j':
-            NUM_THREADS = int(v)
-            assert NUM_THREADS > 0
-        elif t == '-R':
-            IMAGE = v
-        elif t == '-k':
-            KEEP_GOING = True
-        elif t == '-a':
-            EXTRA_JIT_ARGS.append(v)
-        elif t == '-t':
-            TIME_LIMIT = int(v)
-        else:
-            raise Exception((t, v))
+    opts = parser.parse_args()
+    run_memcheck = opts.run_memcheck
+    NUM_THREADS = opts.num_threads
+    IMAGE = os.path.join(orig_dir, opts.image)
+    KEEP_GOING = opts.keep_going
+    EXTRA_JIT_ARGS += opts.extra_args
+    TIME_LIMIT = opts.time_limit
+    TESTS_TO_SKIP = opts.skip_tests.split(',')
+    TESTS_TO_SKIP = filter(bool, TESTS_TO_SKIP) # "".split(',') == ['']
+    EXIT_CODE_ONLY = opts.exit_code_only
+    SKIP_FAILING_TESTS = opts.skip_failing
 
-    TEST_DIR = patterns[0]
+    if opts.quiet:
+        DISPLAY_SUCCESSES = False
+
+    TEST_DIR = os.path.join(orig_dir, opts.test_dir)
+    EXTMODULE_DIR_PYSTON = os.path.abspath(os.path.dirname(os.path.realpath(IMAGE)) + "/test/test_extension/")
+    # EXTMODULE_DIR = os.path.abspath(os.path.dirname(os.path.realpath(IMAGE)) + "/test/test_extension/build/lib.linux-x86_64-2.7/")
+    EXTMODULE_DIR = os.path.abspath(orig_dir) + "/test/test_extension/build/lib.linux-x86_64-2.7/"
+    patterns = opts.pattern
+
+    IS_OPTIMIZED = int(subprocess.check_output([IMAGE, "-c", 'import sysconfig; print int("-O0" not in sysconfig.get_config_var(\"CFLAGS\"))']))
+
+    if not patterns and not TESTS_TO_SKIP:
+        TESTS_TO_SKIP = ["t", "t2", "t3"]
+
     assert os.path.isdir(TEST_DIR), "%s doesn't look like a directory with tests in it" % TEST_DIR
 
-    patterns = patterns[1:]
+    if TEST_DIR.rstrip('/').endswith("cpython") and not EXIT_CODE_ONLY:
+        print >>sys.stderr, "Test directory name ends in cpython; are you sure you don't want --exit-code-only?"
 
-    TOSKIP = ["%s/%s.py" % (TEST_DIR, i) for i in (
-        "tuple_depth",
-        "longargs_stackusage",
-            )]
+    if TEST_DIR.rstrip('/').endswith("extra") or TEST_DIR.rstrip('/').endswith("integration"):
+        if not os.path.exists(os.path.join(TEST_DIR, '../lib/virtualenv/virtualenv.py')):
+            print "Looks like you don't have the integration-test repositories checked out; skipping them."
+            print "If you would like to run them, please run:"
+            print "git submodule update --init --recursive", os.path.join(TEST_DIR, "../lib")
+            sys.exit(0)
 
-    IGNORE_STATS = ["%s/%d.py" % (TEST_DIR, i) for i in (
-        )] + [
-        ]
+    # do we need this any more?
+    IGNORE_STATS = ["%s/%d.py" % (TEST_DIR, i) for i in ()] + []
 
-    def _addto(l, tests):
-        if isinstance(tests, str):
-            tests = [tests]
-        for t in tests:
-            l.append("%s/%s.py" % (TEST_DIR, t))
-    skip = functools.partial(_addto, TOSKIP)
-    nostat = functools.partial(_addto, IGNORE_STATS)
+    tests = [t for t in glob.glob("%s/*.py" % TEST_DIR)]
 
-    if not patterns:
-        skip(["t", "t2"])
+    LIB_DIR = os.path.join(sys.prefix, "lib/python2.7")
+    for t in tests:
+        bn = os.path.basename(t)
+        assert bn.endswith(".py")
+        module_name = bn[:-3]
 
-    def tryParse(s):
-        if s.isdigit():
-            return int(s)
-        return s
-    def key(name):
-        i = tryParse(name)
-        if i < start:
-            return i + 100000
-        return i
-
-    tests = sorted([t for t in glob.glob("%s/*.py" % TEST_DIR)], key=lambda t:key(t[6:-3]))
-    tests += [
-            ]
-    big_tests = [
-            ]
-    tests += big_tests
-
-    for t in TOSKIP:
-        assert t in ("%s/t.py" % TEST_DIR, "%s/t2.py" % TEST_DIR) or t in tests, t
+        if os.path.exists(os.path.join(LIB_DIR, module_name)) or \
+           os.path.exists(os.path.join(LIB_DIR, module_name + ".py")) or \
+           module_name in sys.builtin_module_names:
+            raise Exception("Error: %s hides builtin module '%s'" % (t, module_name))
 
     if patterns:
         filtered_tests = []
         for t in tests:
-            if any(re.match("%s/%s.*\.py" % (TEST_DIR, p), t) for p in patterns):
+            if any(re.match(os.path.join(TEST_DIR, p) + ".*\.py", t) for p in patterns):
                 filtered_tests.append(t)
         tests = filtered_tests
     if not tests:
-        print >>sys.stderr, "No tests specified!"
-        sys.exit(1)
+        # print >>sys.stderr, "No tests matched the given patterns. OK by me!"
+        # this can happen legitimately in e.g. `make check_test_foo` if test_foo.py is a CPython regression test.
+        sys.exit(0)
 
-    FN_JUST_SIZE = max(20, 2 + max(map(len, tests)))
+    FN_JUST_SIZE = max(20, 2 + max(len(os.path.basename(fn)) for fn in tests))
 
     if TEST_PYPY:
         IMAGE = '/usr/local/bin/pypy'
 
     if not patterns:
-        tests.sort(key=fileSize)
+        if opts.order_by_mtime:
+            tests.sort(key=lambda fn:os.stat(fn).st_mtime, reverse=True)
+        else:
+            tests.sort(key=fileSize)
 
     for fn in tests:
-        if fn in TOSKIP:
-            continue
         check_stats = fn not in IGNORE_STATS
         q.put((fn, check_stats, run_memcheck))
 
@@ -413,11 +607,6 @@ if __name__ == "__main__":
         q.put(None)
 
     for fn in tests:
-        if fn in TOSKIP:
-            print fn.rjust(FN_JUST_SIZE),
-            print "   Skipping"
-            continue
-
         with cv:
             while fn not in results:
                 try:
@@ -433,10 +622,27 @@ if __name__ == "__main__":
                 print "(%s also failed)" % fn
             sys.exit(1)
             break
-        print results[fn]
+
+        if results[fn]:
+            name = os.path.basename(fn).rjust(FN_JUST_SIZE)
+            msgs = results[fn]
+            if isinstance(msgs,str):
+                msgs = [msgs]
+            print '    '.join([name] + list(msgs))
 
     for t in threads:
         t.join()
 
     if failed:
         sys.exit(1)
+
+if __name__ == "__main__":
+    origdir = os.getcwd()
+    tmpdir = tempfile.mkdtemp()
+    os.chdir(tmpdir)
+    try:
+        main(origdir)
+    finally:
+        shutil.rmtree(tmpdir)
+
+# adding a comment here to invalidate cached expected results

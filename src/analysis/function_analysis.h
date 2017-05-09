@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,91 +16,95 @@
 #define PYSTON_ANALYSIS_FUNCTIONANALYSIS_H
 
 #include <memory>
-#include <unordered_map>
-#include <unordered_set>
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+
+#include "core/cfg.h"
+#include "core/stringpool.h"
 #include "core/types.h"
 
 namespace pyston {
 
-class AST_arguments;
-class AST_Jump;
-class AST_Name;
+class BST_Jump;
 class CFG;
 class CFGBlock;
-class ScopeInfo;
 class LivenessBBVisitor;
 
 class LivenessAnalysis {
 private:
     CFG* cfg;
+    const CodeConstants& code_constants;
 
     friend class LivenessBBVisitor;
-    typedef std::unordered_map<CFGBlock*, std::unique_ptr<LivenessBBVisitor> > LivenessCacheMap;
+    typedef llvm::DenseMap<CFGBlock*, std::unique_ptr<LivenessBBVisitor>> LivenessCacheMap;
     LivenessCacheMap liveness_cache;
 
-    std::unordered_map<int, std::unordered_map<CFGBlock*, bool> > result_cache;
-
-    // Map strings to unique indices.  For a given CFG, the set of strings should be fairly small
-    // (a constant fraction max of the CFG itself), so just store all of them.  The theory is that
-    // for any particular name, we will do many lookups on it in different hash tables, and by
-    // converting to a string only once, the extra hashtable lookup will be profitable since it
-    // can make all the rest faster (int hashes vs string hashes).
-    //
-    // Haven't validated this, though.
-    std::unordered_map<std::string, int> string_index_map;
-    int getStringIndex(const std::string& s);
+    VRegMap<llvm::DenseMap<CFGBlock*, bool>> result_cache;
 
 public:
-    LivenessAnalysis(CFG* cfg);
+    LivenessAnalysis(CFG* cfg, const CodeConstants& code_constants);
+    ~LivenessAnalysis();
 
-    // we don't keep track of node->parent_block relationships, so you have to pass both:
-    bool isKill(AST_Name* node, CFGBlock* parent_block);
-
-    bool isLiveAtEnd(const std::string& name, CFGBlock* block);
+    bool isLiveAtEnd(int vreg, CFGBlock* block);
+    const CodeConstants& getCodeConstants() const { return code_constants; }
 };
+
+class PhiAnalysis;
 
 class DefinednessAnalysis {
 public:
-    enum DefinitionLevel {
+    enum DefinitionLevel : char {
+        Unknown,
         Undefined,
         PotentiallyDefined,
         Defined,
     };
-    typedef std::unordered_set<std::string> RequiredSet;
 
 private:
-    std::unordered_map<CFGBlock*, std::unordered_map<std::string, DefinitionLevel> > results;
-    std::unordered_map<CFGBlock*, const RequiredSet> defined_at_end;
-    ScopeInfo* scope_info;
+    llvm::DenseMap<CFGBlock*, VRegMap<DefinitionLevel>> defined_at_beginning, defined_at_end;
+    llvm::DenseMap<CFGBlock*, VRegSet> defined_at_end_sets;
 
 public:
-    DefinednessAnalysis(const SourceInfo::ArgNames& args, CFG* cfg, ScopeInfo* scope_info);
+    DefinednessAnalysis() {}
 
-    DefinitionLevel isDefinedAtEnd(const std::string& name, CFGBlock* block);
-    const RequiredSet& getDefinedNamesAtEnd(CFGBlock* block);
+    void run(const CodeConstants& code_constants, VRegMap<DefinitionLevel> initial_map, CFGBlock* initial_block);
+
+    DefinitionLevel isDefinedAtEnd(int vreg, CFGBlock* block);
+    const VRegSet& getDefinedVregsAtEnd(CFGBlock* block);
+
+    friend class PhiAnalysis;
 };
+
 class PhiAnalysis {
 public:
-    typedef std::unordered_set<std::string> RequiredSet;
+    DefinednessAnalysis definedness;
+
+    VRegSet empty_set;
 
 private:
-    DefinednessAnalysis definedness;
     LivenessAnalysis* liveness;
-    std::unordered_map<CFGBlock*, const RequiredSet> required_phis;
+    llvm::DenseMap<CFGBlock*, VRegSet> required_phis;
 
 public:
-    PhiAnalysis(const SourceInfo::ArgNames&, CFG* cfg, LivenessAnalysis* liveness, ScopeInfo* scope_info);
+    // Initials_need_phis specifies that initial_map should count as an additional entry point
+    // that may require phis.
+    PhiAnalysis(VRegMap<DefinednessAnalysis::DefinitionLevel> initial_map, CFGBlock* initial_block,
+                bool initials_need_phis, LivenessAnalysis* liveness);
 
-    bool isRequired(const std::string& name, CFGBlock* block);
-    bool isRequiredAfter(const std::string& name, CFGBlock* block);
-    const RequiredSet& getAllRequiredAfter(CFGBlock* block);
-    const RequiredSet& getAllRequiredFor(CFGBlock* block);
-    bool isPotentiallyUndefinedAfter(const std::string& name, CFGBlock* block);
+    bool isRequired(int vreg, CFGBlock* block);
+    bool isRequiredAfter(int vreg, CFGBlock* block);
+    const VRegSet& getAllRequiredAfter(CFGBlock* block);
+    const VRegSet& getAllRequiredFor(CFGBlock* block);
+    // If "name" may be undefined at the beginning of any immediate successor block of "block":
+    bool isPotentiallyUndefinedAfter(int vreg, CFGBlock* block);
+    // If "name" may be undefined at the beginning of "block"
+    bool isPotentiallyUndefinedAt(int vreg, CFGBlock* block);
 };
 
-LivenessAnalysis* computeLivenessInfo(CFG*);
-PhiAnalysis* computeRequiredPhis(const SourceInfo::ArgNames&, CFG*, LivenessAnalysis*, ScopeInfo* scope_Info);
+std::unique_ptr<LivenessAnalysis> computeLivenessInfo(CFG*, const CodeConstants&);
+std::unique_ptr<PhiAnalysis> computeRequiredPhis(const ParamNames&, CFG*, LivenessAnalysis*);
+std::unique_ptr<PhiAnalysis> computeRequiredPhis(const OSREntryDescriptor*, LivenessAnalysis*);
 }
 
 #endif

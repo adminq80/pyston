@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Dropbox, Inc.
+// Copyright (c) 2014-2016 Dropbox, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,124 +14,175 @@
 
 #include "runtime/import.h"
 
+#include <dlfcn.h>
+#include <fstream>
+#include <limits.h>
+#include <link.h>
+
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 
 #include "codegen/irgen/hooks.h"
 #include "codegen/parser.h"
-#include "runtime/capi.h"
+#include "codegen/unwinding.h"
+#include "core/ast.h"
+#include "runtime/inline/list.h"
 #include "runtime/objmodel.h"
+#include "runtime/util.h"
 
 namespace pyston {
 
-BoxedModule* createAndRunModule(const std::string& name, const std::string& fn) {
-    BoxedModule* module = createModule(name, fn);
-
-    AST_Module* ast = caching_parse(fn.c_str());
-    compileAndRunModule(ast, module);
-    return module;
-}
-
-#if LLVMREV < 210072
-#define LLVM_SYS_FS_EXISTS_CODE_OKAY(code) ((code) == 0)
-#else
-#define LLVM_SYS_FS_EXISTS_CODE_OKAY(code) (!(code))
+#ifdef Py_REF_DEBUG
+bool imported_foreign_cextension = false;
 #endif
 
-static Box* importSub(const std::string* name, Box* parent_module) {
-    BoxedList* path_list;
-    if (parent_module == NULL) {
-        path_list = getSysPath();
-        if (path_list == NULL || path_list->cls != list_cls) {
-            raiseExcHelper(RuntimeError, "sys.path must be a list of directory names");
-        }
-    } else {
-        path_list = static_cast<BoxedList*>(parent_module->getattr("__path__", NULL));
-        if (path_list == NULL || path_list->cls != list_cls) {
-            raiseExcHelper(ImportError, "No module named %s", name->c_str());
-        }
-    }
-
-    llvm::SmallString<128> joined_path;
-    for (int i = 0; i < path_list->size; i++) {
-        Box* _p = path_list->elts->elts[i];
-        if (_p->cls != str_cls)
-            continue;
-        BoxedString* p = static_cast<BoxedString*>(_p);
-
-        joined_path.clear();
-        llvm::sys::path::append(joined_path, p->s, *name + ".py");
-        std::string fn(joined_path.str());
-
-        if (VERBOSITY() >= 2)
-            printf("Searching for %s at %s...\n", name->c_str(), fn.c_str());
-
-#if LLVMREV < 217625
-        bool exists;
-        llvm_error_code code = llvm::sys::fs::exists(joined_path.str(), exists);
-        assert(LLVM_SYS_FS_EXISTS_CODE_OKAY(code));
-#else
-        bool exists = llvm::sys::fs::exists(joined_path.str());
-#endif
-
-        if (!exists)
-            continue;
-
-        if (VERBOSITY() >= 1)
-            printf("Importing %s from %s\n", name->c_str(), fn.c_str());
-
-        BoxedModule* module = createAndRunModule(*name, fn);
-        return module;
-    }
-
-    if (*name == "basic_test") {
-        return importTestExtension("basic_test");
-    }
-    if (*name == "descr_test") {
-        return importTestExtension("descr_test");
-    }
-
-    raiseExcHelper(ImportError, "No module named %s", name->c_str());
+static void removeModule(BoxedString* name) {
+    BoxedDict* d = getSysModulesDict();
+    PyDict_DelItem(d, name);
 }
 
-static Box* import(const std::string* name, bool return_first) {
-    assert(name);
-    assert(name->size() > 0);
+extern "C" BORROWED(PyObject*) PyImport_GetModuleDict(void) noexcept {
+    try {
+        return getSysModulesDict();
+    } catch (ExcInfo e) {
+        setCAPIException(e);
+        return NULL;
+    }
+}
 
-    static StatCounter slowpath_import("slowpath_import");
-    slowpath_import.log();
+extern "C" PyObject* _PyImport_LoadDynamicModule(char* name, char* pathname, FILE* fp) noexcept {
+    BoxedString* name_boxed = boxString(name);
+    AUTO_DECREF(name_boxed);
+    try {
+        PyObject* m = _PyImport_FindExtension(name, pathname);
+        if (m != NULL) {
+            Py_INCREF(m);
+            return m;
+        }
+
+        const char* lastdot = strrchr(name, '.');
+        const char* shortname;
+        if (lastdot == NULL) {
+            shortname = name;
+        } else {
+            shortname = lastdot + 1;
+        }
+
+        m = importCExtension(name_boxed, shortname, pathname);
+
+        if (_PyImport_FixupExtension(name, pathname) == NULL) {
+            Py_DECREF(m);
+            return NULL;
+        }
+
+        return m;
+    } catch (ExcInfo e) {
+        removeModule(name_boxed);
+        setCAPIException(e);
+        return NULL;
+    }
+}
+
+extern "C" PyObject* load_source_module(char* name, char* pathname, FILE* fp) noexcept {
+    BoxedString* name_boxed = boxString(name);
+    AUTO_DECREF(name_boxed);
+    try {
+        BoxedModule* module = createModule(name_boxed, pathname);
+        std::unique_ptr<ASTAllocator> ast_allocator;
+        AST_Module* ast;
+        std::tie(ast, ast_allocator) = caching_parse_file(pathname, /* future_flags = */ 0);
+        assert(ast);
+        compileAndRunModule(ast, module);
+        Box* r = getSysModulesDict()->getOrNull(name_boxed);
+        if (!r) {
+            PyErr_Format(ImportError, "Loaded module %.200s not found in sys.modules", name);
+            return NULL;
+        }
+        if (Py_VerboseFlag)
+            PySys_WriteStderr("import %s # from %s\n", name, pathname);
+        return incref(r);
+    } catch (ExcInfo e) {
+        removeModule(name_boxed);
+        setCAPIException(e);
+        return NULL;
+    }
+}
+
+extern "C" PyObject* PyImport_ExecCodeModuleEx(const char* name, PyObject* co, char* pathname) noexcept {
+    BoxedString* s = boxString(name);
+    AUTO_DECREF(s);
+    try {
+        RELEASE_ASSERT(co->cls == str_cls, "");
+        BoxedString* code = (BoxedString*)co;
+
+        BoxedModule* module = (BoxedModule*)PyImport_AddModule(name);
+        if (module == NULL)
+            return NULL;
+
+        static BoxedString* file_str = getStaticString("__file__");
+        module->setattr(file_str, autoDecref(boxString(pathname)), NULL);
+        AST_Module* ast;
+        std::unique_ptr<ASTAllocator> ast_allocator;
+        std::tie(ast, ast_allocator) = parse_string(code->data(), /* future_flags = */ 0);
+        compileAndRunModule(ast, module);
+        return incref(module);
+    } catch (ExcInfo e) {
+        removeModule(s);
+        setCAPIException(e);
+        return NULL;
+    }
+}
+
+extern "C" Box* import(int level, Box* from_imports, BoxedString* module_name) {
+    assert(module_name->cls == str_cls);
+    Box* rtn = PyImport_ImportModuleLevel(module_name->c_str(), getGlobalsDict(), NULL, from_imports, level);
+    if (!rtn)
+        throwCAPIException();
+    return rtn;
+}
+
+BoxedModule* importCExtension(BoxedString* full_name, const std::string& last_name, const std::string& path) {
+    void* handle = dlopen(path.c_str(), RTLD_NOW);
+    if (!handle)
+        raiseExcHelper(ImportError, "%s", dlerror());
+    assert(handle);
+
+    std::string initname = "init" + last_name;
+    void (*init)() = (void (*)())dlsym(handle, initname.c_str());
+
+    char* error;
+    if ((error = dlerror()) != NULL)
+        raiseExcHelper(ImportError, "%s", error);
+
+    assert(init);
+
+    char* packagecontext = strdup(full_name->c_str());
+    char* oldcontext = _Py_PackageContext;
+    _Py_PackageContext = packagecontext;
+    (*init)();
+    _Py_PackageContext = oldcontext;
+    free(packagecontext);
+
+    checkAndThrowCAPIException();
 
     BoxedDict* sys_modules = getSysModulesDict();
+    Box* _m = sys_modules->d[full_name];
+    RELEASE_ASSERT(_m, "dynamic module not initialized properly");
+    assert(_m->cls == module_cls);
 
-    size_t l = 0, r;
-    Box* last_module = NULL;
-    Box* first_module = NULL;
-    while (l < name->size()) {
-        size_t r = name->find('.', l);
-        if (r == std::string::npos) {
-            r = name->size();
-        }
+    BoxedModule* m = static_cast<BoxedModule*>(_m);
+    static BoxedString* file_str = getStaticString("__file__");
+    m->setattr(file_str, autoDecref(boxString(path)), NULL);
 
-        std::string prefix_name = std::string(*name, 0, r);
-        Box* s = boxStringPtr(&prefix_name);
-        if (sys_modules->d.find(s) != sys_modules->d.end()) {
-            last_module = sys_modules->d[s];
-        } else {
-            std::string small_name = std::string(*name, l, r - l);
-            last_module = importSub(&small_name, last_module);
-        }
+    if (Py_VerboseFlag)
+        PySys_WriteStderr("import %s # dynamically loaded from %s\n", full_name->c_str(), path.c_str());
 
-        if (l == 0) {
-            first_module = last_module;
-        }
+#ifdef Py_REF_DEBUG
+    // if we load a foreign C extension we can't check that _Py_RefTotal == 0
+    if (!llvm::StringRef(path).endswith("lib/python2.7/lib-dynload/" + last_name + ".pyston.so"))
+        imported_foreign_cextension = true;
+#endif
 
-        l = r + 1;
-    }
-
-    return return_first ? first_module : last_module;
-}
-
-extern "C" Box* import(int level, Box* from_imports, const std::string* module_name) {
-    return import(module_name, from_imports == None);
+    return incref(m);
 }
 }
